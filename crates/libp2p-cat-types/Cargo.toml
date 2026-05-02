@@ -1,0 +1,14 @@
+[package]
+name = "libp2p-cat-types"
+description = "Shared types for libp2p-cat-rs: PeerId, UdpAddr, ProtocolId, Error."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

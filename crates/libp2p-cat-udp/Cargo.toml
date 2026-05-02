@@ -1,0 +1,16 @@
+[package]
+name = "libp2p-cat-udp"
+description = "UDP datagram transport for libp2p-cat-rs, exposed as an Io-shaped linear transport."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+comp-cat-rs = { workspace = true }
+libp2p-cat-types = { workspace = true }
+
+[lints]
+workspace = true
