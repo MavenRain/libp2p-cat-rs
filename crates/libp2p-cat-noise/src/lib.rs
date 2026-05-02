@@ -74,4 +74,6 @@ pub use handshake::{
     MESSAGE_3_LEN, Responder, ResponderAfterE, ResponderAfterResponse,
 };
 pub use primitives::{StaticKeypair, StaticPrivateKey, StaticPublicKey};
-pub use transport::{REPLAY_WINDOW_BITS, TRANSPORT_NONCE_PREFIX_LEN, TransportState};
+pub use transport::{
+    REPLAY_WINDOW_BITS, TRANSPORT_NONCE_PREFIX_LEN, TRANSPORT_OVERHEAD, TransportState,
+};

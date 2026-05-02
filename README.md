@@ -25,15 +25,29 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | ---------------------- | -------------------------------------------------------- |
 | `libp2p-cat-types`     | `PeerId`, `UdpAddr`, `ProtocolId`, workspace `Error`.    |
 | `libp2p-cat-udp`       | `UdpTransport`: linear `Io`-shaped UDP datagram socket.  |
+| `libp2p-cat-noise`     | Noise XX handshake + AEAD transport over datagrams.      |
+| `libp2p-cat-pubsub`    | RLNC pubsub on top of `rlnc-cat-rs::gossip`.             |
+| `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop.       |
+| `libp2p-cat-rs`        | Top-level umbrella re-exporting the four layers above.   |
 
-Future (not yet implemented):
+A runnable two-peer chat example lives at `examples/chat/`:
 
-| Crate                  | Purpose                                                  |
+```bash
+# terminal 1 (responder)
+cargo run -p libp2p-cat-rs-example-chat -- 127.0.0.1:4001
+# terminal 2 (initiator)
+cargo run -p libp2p-cat-rs-example-chat -- 127.0.0.1:4002 127.0.0.1:4001
+```
+
+Future:
+
+| Piece                  | Purpose                                                  |
 | ---------------------- | -------------------------------------------------------- |
-| `libp2p-cat-noise`     | Noise XX handshake state machine over datagrams.         |
-| `libp2p-cat-pubsub`    | Topic router on top of `rlnc-cat-rs::gossip`.            |
-| `libp2p-cat-host`      | Dial / listen / register-protocol facade.                |
-| `libp2p-cat-rs`        | Top-level re-export.                                     |
+| `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding via signed-Noise-extension.     |
+| pubsub-on-host         | Layer pubsub on top of host so one socket carries both.  |
+| RLNC relay/recode      | Multi-hop pubsub: each relay verifies+recodes pieces.    |
+| Kademlia DHT           | Peer discovery and content routing.                      |
+| NAT traversal          | Rendezvous-based UDP hole-punching.                      |
 
 ## Why UDP-only?
 

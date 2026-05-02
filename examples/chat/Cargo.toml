@@ -1,0 +1,21 @@
+[package]
+name = "libp2p-cat-rs-example-chat"
+description = "Two-peer authenticated chat over UDP+Noise built on libp2p-cat-host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "chat"
+path = "src/main.rs"
+
+[dependencies]
+libp2p-cat-rs = { workspace = true }
+getrandom = { workspace = true }
+
+[lints]
+workspace = true

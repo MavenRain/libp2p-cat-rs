@@ -1,0 +1,19 @@
+[package]
+name = "libp2p-cat-rs"
+description = "Categorical, UDP-only, RLNC-native peer-to-peer stack: top-level umbrella re-exporting types/udp/noise/pubsub/host."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+libp2p-cat-types = { workspace = true }
+libp2p-cat-udp = { workspace = true }
+libp2p-cat-noise = { workspace = true }
+libp2p-cat-pubsub = { workspace = true }
+libp2p-cat-host = { workspace = true }
+
+[lints]
+workspace = true
