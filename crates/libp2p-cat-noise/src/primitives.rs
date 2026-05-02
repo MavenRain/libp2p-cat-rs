@@ -177,17 +177,28 @@ fn dh_raw(private_bytes: &[u8; KEY_LEN], public_bytes: &[u8; KEY_LEN]) -> [u8; K
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p_cat_types::Error;
 
-    #[test]
-    fn keypair_derives_consistent_public() {
-        let private = [7u8; KEY_LEN];
-        let kp_a = StaticKeypair::from_private_bytes(private);
-        let kp_b = StaticKeypair::from_private_bytes(private);
-        assert_eq!(kp_a.public(), kp_b.public());
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::NoiseProtocol { reason: reason() })
+        }
     }
 
     #[test]
-    fn dh_is_symmetric() {
+    fn keypair_derives_consistent_public() -> Result<(), Error> {
+        let private = [7u8; KEY_LEN];
+        let kp_a = StaticKeypair::from_private_bytes(private);
+        let kp_b = StaticKeypair::from_private_bytes(private);
+        check(kp_a.public() == kp_b.public(), || {
+            "public-key derivation should be deterministic in private bytes".to_owned()
+        })
+    }
+
+    #[test]
+    fn dh_is_symmetric() -> Result<(), Error> {
         let alice = StaticKeypair::from_private_bytes([1u8; KEY_LEN]);
         let bob = StaticKeypair::from_private_bytes([2u8; KEY_LEN]);
         let alice_eph = EphemeralPrivateKey::from_seed([3u8; KEY_LEN]);
@@ -195,16 +206,22 @@ mod tests {
 
         let ee_a = dh_ee(&alice_eph, &bob_eph.public());
         let ee_b = dh_ee(&bob_eph, &alice_eph.public());
-        assert_eq!(ee_a.as_bytes(), ee_b.as_bytes());
+        check(ee_a.as_bytes() == ee_b.as_bytes(), || {
+            "ephemeral-ephemeral DH not symmetric".to_owned()
+        })?;
 
         // alice's static + bob's ephemeral matches bob's ephemeral + alice's static.
         let s_e = dh_se(alice.private(), &bob_eph.public());
         let e_s = dh_es(&bob_eph, alice.public());
-        assert_eq!(s_e.as_bytes(), e_s.as_bytes());
+        check(s_e.as_bytes() == e_s.as_bytes(), || {
+            "alice-static / bob-ephemeral DH not symmetric".to_owned()
+        })?;
 
         // The reverse pairing.
-        let s_e = dh_se(bob.private(), &alice_eph.public());
-        let e_s = dh_es(&alice_eph, bob.public());
-        assert_eq!(s_e.as_bytes(), e_s.as_bytes());
+        let s_e2 = dh_se(bob.private(), &alice_eph.public());
+        let e_s2 = dh_es(&alice_eph, bob.public());
+        check(s_e2.as_bytes() == e_s2.as_bytes(), || {
+            "bob-static / alice-ephemeral DH not symmetric".to_owned()
+        })
     }
 }

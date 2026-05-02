@@ -46,15 +46,26 @@ fn roundtrip_pipeline(family: UdpAddr, payload: Vec<u8>) -> Io<Error, (UdpAddr, 
     })
 }
 
+fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+    if cond {
+        Ok(())
+    } else {
+        Err(Error::HostState { reason: reason() })
+    }
+}
+
 #[test]
 fn datagram_roundtrip_v4() -> Result<(), Error> {
     let payload: Vec<u8> = b"hello libp2p-cat".to_vec();
     let expected = payload.clone();
     let (observed_from, observed_bytes, sender_addr) =
         roundtrip_pipeline(loopback_v4(), payload).run()?;
-    assert_eq!(observed_bytes, expected);
-    assert_eq!(observed_from, sender_addr);
-    Ok(())
+    check(observed_bytes == expected, || {
+        format!("v4 payload mismatch: expected {expected:?}, got {observed_bytes:?}")
+    })?;
+    check(observed_from == sender_addr, || {
+        format!("v4 source mismatch: expected {sender_addr}, got {observed_from}")
+    })
 }
 
 #[test]
@@ -63,16 +74,22 @@ fn datagram_roundtrip_v6() -> Result<(), Error> {
     let expected = payload.clone();
     let (observed_from, observed_bytes, sender_addr) =
         roundtrip_pipeline(loopback_v6(), payload).run()?;
-    assert_eq!(observed_bytes, expected);
-    assert_eq!(observed_from, sender_addr);
-    Ok(())
+    check(observed_bytes == expected, || {
+        format!("v6 payload mismatch: expected {expected:?}, got {observed_bytes:?}")
+    })?;
+    check(observed_from == sender_addr, || {
+        format!("v6 source mismatch: expected {sender_addr}, got {observed_from}")
+    })
 }
 
 #[test]
 fn empty_datagram_roundtrips() -> Result<(), Error> {
     let (observed_from, observed_bytes, sender_addr) =
         roundtrip_pipeline(loopback_v4(), Vec::new()).run()?;
-    assert!(observed_bytes.is_empty());
-    assert_eq!(observed_from, sender_addr);
-    Ok(())
+    check(observed_bytes.is_empty(), || {
+        format!("expected empty payload, got {} bytes", observed_bytes.len())
+    })?;
+    check(observed_from == sender_addr, || {
+        format!("source mismatch: expected {sender_addr}, got {observed_from}")
+    })
 }

@@ -133,9 +133,31 @@ fn three_node_rlnc_broadcast_decodes_at_both_receivers() -> Result<(), Error> {
             reason: "carol did not decode the message".to_owned(),
         })?;
 
-    assert_eq!(bob_msg.topic, topic);
-    assert_eq!(carol_msg.topic, topic);
-    assert_eq!(&bob_msg.data[..payload.len()], payload);
-    assert_eq!(&carol_msg.data[..payload.len()], payload);
+    let check = |cond: bool, reason: &str| -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::PubsubProtocol {
+                reason: reason.to_owned(),
+            })
+        }
+    };
+    check(bob_msg.topic == topic, "bob topic mismatch")?;
+    check(carol_msg.topic == topic, "carol topic mismatch")?;
+    let bob_prefix = bob_msg
+        .data
+        .get(..payload.len())
+        .ok_or_else(|| Error::PubsubProtocol {
+            reason: "bob's reconstructed bytes shorter than original payload".to_owned(),
+        })?;
+    let carol_prefix =
+        carol_msg
+            .data
+            .get(..payload.len())
+            .ok_or_else(|| Error::PubsubProtocol {
+                reason: "carol's reconstructed bytes shorter than original payload".to_owned(),
+            })?;
+    check(bob_prefix == payload, "bob payload mismatch")?;
+    check(carol_prefix == payload, "carol payload mismatch")?;
     Ok(())
 }

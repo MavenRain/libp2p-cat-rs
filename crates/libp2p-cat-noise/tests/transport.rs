@@ -24,6 +24,58 @@ fn established_pair() -> Result<(TransportState, TransportState), Error> {
     Ok((alice_transport, bob_transport))
 }
 
+fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+    if cond {
+        Ok(())
+    } else {
+        Err(Error::NoiseProtocol { reason: reason() })
+    }
+}
+
+fn expect_decrypt_failure(outcome: Result<(TransportState, Vec<u8>), Error>) -> Result<(), Error> {
+    match outcome {
+        Err(Error::NoiseDecrypt) => Ok(()),
+        other_err @ Err(_) => Err(Error::NoiseProtocol {
+            reason: format!("expected NoiseDecrypt, got {:?}", other_err.err()),
+        }),
+        Ok((_state, _bytes)) => Err(Error::NoiseProtocol {
+            reason: "expected NoiseDecrypt, got Ok".to_owned(),
+        }),
+    }
+}
+
+fn expect_replay(
+    outcome: Result<(TransportState, Vec<u8>), Error>,
+    expected_nonce: u64,
+) -> Result<(), Error> {
+    match outcome {
+        Err(Error::NoiseReplay { nonce }) if nonce == expected_nonce => Ok(()),
+        other_err @ Err(_) => Err(Error::NoiseProtocol {
+            reason: format!(
+                "expected NoiseReplay {{ nonce: {expected_nonce} }}, got {:?}",
+                other_err.err()
+            ),
+        }),
+        Ok((_state, _bytes)) => Err(Error::NoiseProtocol {
+            reason: format!("expected NoiseReplay, got Ok at nonce {expected_nonce}"),
+        }),
+    }
+}
+
+fn expect_protocol_violation(
+    outcome: Result<(TransportState, Vec<u8>), Error>,
+) -> Result<(), Error> {
+    match outcome {
+        Err(Error::NoiseProtocol { .. }) => Ok(()),
+        other_err @ Err(_) => Err(Error::NoiseProtocol {
+            reason: format!("expected NoiseProtocol, got {:?}", other_err.err()),
+        }),
+        Ok((_state, _bytes)) => Err(Error::NoiseProtocol {
+            reason: "expected NoiseProtocol, got Ok".to_owned(),
+        }),
+    }
+}
+
 #[test]
 fn encrypt_decrypt_round_trip() -> Result<(), Error> {
     let (alice, bob) = established_pair()?;
@@ -31,23 +83,21 @@ fn encrypt_decrypt_round_trip() -> Result<(), Error> {
     let expected = plaintext.clone();
     let (_alice, datagram) = alice.encrypt(&plaintext)?;
     let (_bob, recovered) = bob.decrypt(&datagram)?;
-    assert_eq!(recovered, expected);
-    Ok(())
+    check(recovered == expected, || {
+        format!("round-trip mismatch: {recovered:?}")
+    })
 }
 
 #[test]
 fn tampered_ciphertext_is_rejected() -> Result<(), Error> {
     let (alice, bob) = established_pair()?;
     let (_alice, datagram) = alice.encrypt(b"hello")?;
-    // Flip a bit deep in the ciphertext (skip the 8-byte nonce prefix).
     let tampered: Vec<u8> = datagram
         .iter()
         .enumerate()
         .map(|(i, &b)| if i == 10 { b ^ 0x80 } else { b })
         .collect();
-    let outcome = bob.decrypt(&tampered);
-    assert!(matches!(outcome, Err(Error::NoiseDecrypt)));
-    Ok(())
+    expect_decrypt_failure(bob.decrypt(&tampered))
 }
 
 #[test]
@@ -55,52 +105,38 @@ fn replayed_datagram_is_rejected() -> Result<(), Error> {
     let (alice, bob) = established_pair()?;
     let (_alice, datagram) = alice.encrypt(b"once")?;
     let (bob, _first) = bob.decrypt(&datagram)?;
-    let outcome = bob.decrypt(&datagram);
-    assert!(matches!(outcome, Err(Error::NoiseReplay { nonce: 0 })));
-    Ok(())
+    expect_replay(bob.decrypt(&datagram), 0)
 }
 
 #[test]
 fn out_of_order_within_window_is_accepted() -> Result<(), Error> {
     let (alice, bob) = established_pair()?;
-    // Encrypt three datagrams without delivering them yet.
     let (alice, dg0) = alice.encrypt(b"first")?;
     let (alice, dg1) = alice.encrypt(b"second")?;
     let (_alice, dg2) = alice.encrypt(b"third")?;
-    // Deliver out of order: 2 then 0 then 1.  All three should decrypt.
     let (bob, p2) = bob.decrypt(&dg2)?;
-    assert_eq!(p2, b"third");
+    check(p2 == b"third", || format!("p2 mismatch: {p2:?}"))?;
     let (bob, p0) = bob.decrypt(&dg0)?;
-    assert_eq!(p0, b"first");
+    check(p0 == b"first", || format!("p0 mismatch: {p0:?}"))?;
     let (_bob, p1) = bob.decrypt(&dg1)?;
-    assert_eq!(p1, b"second");
-    Ok(())
+    check(p1 == b"second", || format!("p1 mismatch: {p1:?}"))
 }
 
 #[test]
 fn datagram_below_window_is_rejected() -> Result<(), Error> {
     let (alice, bob) = established_pair()?;
-    // Capture an early datagram (nonce 0) but don't deliver it.
     let (alice, early_datagram) = alice.encrypt(b"early")?;
-    // Advance alice 70 more steps so the next datagram's nonce is well
-    // outside the 64-bit replay window.
     let advanced = (1u64..=70).try_fold(alice, |state, i| -> Result<TransportState, Error> {
         let (next, _) = state.encrypt(format!("filler {i}").as_bytes())?;
         Ok(next)
     })?;
     let (_alice_final, far_datagram) = advanced.encrypt(b"far ahead")?;
-    // Deliver the far-ahead datagram first to advance bob's state.
     let (bob, _) = bob.decrypt(&far_datagram)?;
-    // Now the early datagram (nonce 0) is below the window edge.
-    let outcome = bob.decrypt(&early_datagram);
-    assert!(matches!(outcome, Err(Error::NoiseReplay { nonce: 0 })));
-    Ok(())
+    expect_replay(bob.decrypt(&early_datagram), 0)
 }
 
 #[test]
 fn rejects_truncated_datagram() -> Result<(), Error> {
     let (_alice, bob) = established_pair()?;
-    let outcome = bob.decrypt(&[0u8; 8]); // nonce only, no tag
-    assert!(matches!(outcome, Err(Error::NoiseProtocol { .. })));
-    Ok(())
+    expect_protocol_violation(bob.decrypt(&[0u8; 8]))
 }

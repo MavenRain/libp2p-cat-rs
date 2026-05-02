@@ -22,6 +22,7 @@
 //! # Examples
 //!
 //! ```
+//! # fn main() -> Result<(), Box<dyn core::error::Error>> {
 //! use libp2p_cat_types::PeerId;
 //!
 //! // 32 zero bytes is a perfectly fine input shape, even if it's not a
@@ -29,10 +30,15 @@
 //! // operation; key validity is checked elsewhere.
 //! let zero_key = [0u8; 32];
 //! let id = PeerId::from_ed25519(&zero_key);
-//! assert_eq!(id.as_bytes().len(), 38);
+//! (id.as_bytes().len() == 38)
+//!     .then_some(())
+//!     .ok_or("expected 38-byte multihash")?;
 //! // Identity multihash code, then varint length 36, then the
 //! // protobuf-encoded PublicKey.
-//! assert_eq!(id.as_bytes().get(..2), Some(&[0x00, 0x24][..]));
+//! (id.as_bytes().get(..2) == Some(&[0x00, 0x24][..]))
+//!     .then_some(())
+//!     .ok_or("multihash header bytes do not match")?;
+//! # Ok(()) }
 //! ```
 
 use core::fmt;
@@ -185,42 +191,65 @@ fn identity_multihash_from_array(pb: &[u8; ED25519_PROTOBUF_LEN]) -> [u8; ED2551
 mod tests {
     use super::*;
 
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::HostState { reason: reason() })
+        }
+    }
+
     #[test]
-    fn ed25519_peer_id_has_canonical_38_byte_shape() {
+    fn ed25519_peer_id_has_canonical_38_byte_shape() -> Result<(), Error> {
         let key = [0u8; 32];
         let id = PeerId::from_ed25519(&key);
         let bytes = id.as_bytes();
-        assert_eq!(bytes.len(), 38);
-        // Identity multihash code, varint length 36.
-        assert_eq!(bytes.first(), Some(&0x00));
-        assert_eq!(bytes.get(1), Some(&0x24));
-        // Protobuf header: tag1=Ed25519, tag2=len-prefixed 32 bytes.
-        assert_eq!(bytes.get(2..6), Some(&[0x08, 0x01, 0x12, 0x20][..]));
-        // Embedded key bytes are zero in this test.
-        assert!(bytes.get(6..).is_some_and(|s| s.iter().all(|&b| b == 0)));
+        check(bytes.len() == 38, || {
+            format!("expected 38-byte multihash, got {}", bytes.len())
+        })?;
+        check(bytes.first() == Some(&0x00), || {
+            "first byte must be identity multihash code 0x00".to_owned()
+        })?;
+        check(bytes.get(1) == Some(&0x24), || {
+            "second byte must be varint length 36 = 0x24".to_owned()
+        })?;
+        check(
+            bytes.get(2..6) == Some(&[0x08, 0x01, 0x12, 0x20][..]),
+            || "protobuf header bytes do not match Ed25519 PublicKey shape".to_owned(),
+        )?;
+        check(
+            bytes.get(6..).is_some_and(|s| s.iter().all(|&b| b == 0)),
+            || "embedded key bytes should be zero in this test".to_owned(),
+        )
     }
 
     #[test]
-    fn ed25519_peer_id_embeds_supplied_key_bytes() {
+    fn ed25519_peer_id_embeds_supplied_key_bytes() -> Result<(), Error> {
         let key: [u8; 32] = core::array::from_fn(|i| u8::try_from(i).unwrap_or(0));
         let id = PeerId::from_ed25519(&key);
         let bytes = id.as_bytes();
-        assert_eq!(bytes.get(6..), Some(&key[..]));
+        check(bytes.get(6..) == Some(&key[..]), || {
+            "trailing 32 bytes should equal the supplied key".to_owned()
+        })
     }
 
     #[test]
-    fn equality_is_by_multihash_bytes() {
+    fn equality_is_by_multihash_bytes() -> Result<(), Error> {
         let key = [7u8; 32];
         let a = PeerId::from_ed25519(&key);
         let b = PeerId::from_ed25519(&key);
-        assert_eq!(a, b);
+        check(a == b, || {
+            "two PeerIds from the same key should compare equal".to_owned()
+        })
     }
 
     #[test]
-    fn distinct_keys_produce_distinct_peer_ids() {
+    fn distinct_keys_produce_distinct_peer_ids() -> Result<(), Error> {
         let a = PeerId::from_ed25519(&[1u8; 32]);
         let b = PeerId::from_ed25519(&[2u8; 32]);
-        assert_ne!(a, b);
+        check(a != b, || {
+            "distinct keys should produce distinct PeerIds".to_owned()
+        })
     }
 
     #[test]
@@ -232,23 +261,32 @@ mod tests {
             .chain(key.iter().copied())
             .collect();
         let id = PeerId::from_public_key_protobuf(&pb)?;
-        assert_eq!(id, PeerId::from_ed25519(&key));
-        Ok(())
+        check(id == PeerId::from_ed25519(&key), || {
+            "protobuf-derived PeerId differs from from_ed25519".to_owned()
+        })
     }
 
     #[test]
-    fn from_public_key_protobuf_rejects_oversized_payloads() {
+    fn from_public_key_protobuf_rejects_oversized_payloads() -> Result<(), Error> {
         let oversized = vec![0u8; MAX_INLINE_KEY_BYTES + 1];
-        let r = PeerId::from_public_key_protobuf(&oversized);
-        assert!(matches!(r, Err(Error::InvalidPeerId { .. })));
+        match PeerId::from_public_key_protobuf(&oversized) {
+            Err(Error::InvalidPeerId { .. }) => Ok(()),
+            other => Err(Error::HostState {
+                reason: format!("expected InvalidPeerId rejection, got {other:?}"),
+            }),
+        }
     }
 
     #[test]
-    fn display_emits_mh_prefixed_hex() {
+    fn display_emits_mh_prefixed_hex() -> Result<(), Error> {
         let id = PeerId::from_ed25519(&[0u8; 32]);
         let s = id.to_string();
-        assert!(s.starts_with("mh:"));
+        check(s.starts_with("mh:"), || {
+            format!("display should be mh:-prefixed hex, got {s}")
+        })?;
         // 3 prefix characters + 2 chars per byte * 38 bytes = 79.
-        assert_eq!(s.len(), 3 + 2 * 38);
+        check(s.len() == 3 + 2 * 38, || {
+            format!("unexpected display length {}", s.len())
+        })
     }
 }

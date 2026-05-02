@@ -69,6 +69,15 @@ pub enum Error {
         /// Description of the violation.
         reason: String,
     },
+
+    /// A host-layer state violation: send to an address with no
+    /// established connection, dial of an address with an in-flight
+    /// handshake already, or any other shape mismatch in the host's
+    /// connection bookkeeping.
+    HostState {
+        /// Description of the violation.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -94,6 +103,7 @@ impl fmt::Display for Error {
             Self::PubsubProtocol { reason } => {
                 write!(f, "pubsub protocol violation: {reason}")
             }
+            Self::HostState { reason } => write!(f, "host state violation: {reason}"),
         }
     }
 }
@@ -109,7 +119,8 @@ impl std::error::Error for Error {
             | Self::NoiseProtocol { .. }
             | Self::NoiseReplay { .. }
             | Self::RlncLayer { .. }
-            | Self::PubsubProtocol { .. } => None,
+            | Self::PubsubProtocol { .. }
+            | Self::HostState { .. } => None,
         }
     }
 }

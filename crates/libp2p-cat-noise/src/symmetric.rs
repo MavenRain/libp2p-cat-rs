@@ -196,6 +196,14 @@ pub(crate) fn aead_decrypt(
 mod tests {
     use super::*;
 
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::NoiseProtocol { reason: reason() })
+        }
+    }
+
     #[test]
     fn aead_round_trip_through_helpers() -> Result<(), Error> {
         let key = [9u8; KEY_LEN];
@@ -203,26 +211,31 @@ mod tests {
         let plaintext = b"the quick brown fox";
         let ciphertext = aead_encrypt(&key, 17, aad, plaintext)?;
         let recovered = aead_decrypt(&key, 17, aad, &ciphertext)?;
-        assert_eq!(recovered, plaintext);
-        Ok(())
+        check(recovered == plaintext, || {
+            format!("decrypted bytes do not match plaintext: {recovered:?}")
+        })
     }
 
     #[test]
-    fn aead_decrypt_rejects_wrong_nonce() {
+    fn aead_decrypt_rejects_wrong_nonce() -> Result<(), Error> {
         let key = [9u8; KEY_LEN];
         let aad = b"";
-        let ciphertext = aead_encrypt(&key, 1, aad, b"hello").unwrap_or_default();
-        let outcome = aead_decrypt(&key, 2, aad, &ciphertext);
-        assert!(matches!(outcome, Err(Error::NoiseDecrypt)));
+        let ciphertext = aead_encrypt(&key, 1, aad, b"hello")?;
+        match aead_decrypt(&key, 2, aad, &ciphertext) {
+            Err(Error::NoiseDecrypt) => Ok(()),
+            other => Err(Error::NoiseProtocol {
+                reason: format!("expected NoiseDecrypt, got {other:?}"),
+            }),
+        }
     }
 
     #[test]
-    fn kdf_outputs_are_deterministic_and_distinct() {
+    fn kdf_outputs_are_deterministic_and_distinct() -> Result<(), Error> {
         let key = [1u8; KEY_LEN];
         let (a, b) = kdf_two(&key, b"input");
         let (a2, b2) = kdf_two(&key, b"input");
-        assert_eq!(a, a2);
-        assert_eq!(b, b2);
-        assert_ne!(a, b);
+        check(a == a2, || "first kdf output not deterministic".to_owned())?;
+        check(b == b2, || "second kdf output not deterministic".to_owned())?;
+        check(a != b, || "kdf halves must be distinct".to_owned())
     }
 }

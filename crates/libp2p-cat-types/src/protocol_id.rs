@@ -9,13 +9,17 @@
 //! # Examples
 //!
 //! ```
+//! # fn main() -> Result<(), Box<dyn core::error::Error>> {
 //! use libp2p_cat_types::ProtocolId;
 //!
 //! let p = ProtocolId::new("/libp2p-cat/pubsub/1.0.0".to_owned());
-//! assert!(p.is_ok());
+//! p.as_ref().map_err(|e| format!("rejected good name: {e}"))?;
 //!
 //! let bad = ProtocolId::new("no-leading-slash".to_owned());
-//! assert!(bad.is_err());
+//! bad.is_err()
+//!     .then_some(())
+//!     .ok_or("expected validation rejection")?;
+//! # Ok(()) }
 //! ```
 
 use core::fmt;
@@ -88,41 +92,59 @@ impl From<ProtocolId> for String {
 mod tests {
     use super::*;
 
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::HostState { reason: reason() })
+        }
+    }
+
+    fn expect_invalid(outcome: Result<ProtocolId, Error>) -> Result<(), Error> {
+        match outcome {
+            Err(Error::InvalidProtocolId { .. }) => Ok(()),
+            Ok(p) => Err(Error::HostState {
+                reason: format!("expected validation rejection, got Ok({p})"),
+            }),
+            Err(other) => Err(Error::HostState {
+                reason: format!("expected InvalidProtocolId, got {other:?}"),
+            }),
+        }
+    }
+
     #[test]
     fn accepts_well_formed_name() -> Result<(), Error> {
         let p = ProtocolId::new("/libp2p-cat/pubsub/1.0.0".to_owned())?;
-        assert_eq!(p.as_str(), "/libp2p-cat/pubsub/1.0.0");
-        Ok(())
+        check(p.as_str() == "/libp2p-cat/pubsub/1.0.0", || {
+            format!("unexpected stored name: {}", p.as_str())
+        })
     }
 
     #[test]
-    fn rejects_missing_leading_slash() {
-        let r = ProtocolId::new("libp2p-cat".to_owned());
-        assert!(matches!(r, Err(Error::InvalidProtocolId { .. })));
+    fn rejects_missing_leading_slash() -> Result<(), Error> {
+        expect_invalid(ProtocolId::new("libp2p-cat".to_owned()))
     }
 
     #[test]
-    fn rejects_empty_string() {
-        let r = ProtocolId::new(String::new());
-        assert!(matches!(r, Err(Error::InvalidProtocolId { .. })));
+    fn rejects_empty_string() -> Result<(), Error> {
+        expect_invalid(ProtocolId::new(String::new()))
     }
 
     #[test]
-    fn rejects_whitespace() {
-        let r = ProtocolId::new("/libp2p cat/1.0.0".to_owned());
-        assert!(matches!(r, Err(Error::InvalidProtocolId { .. })));
+    fn rejects_whitespace() -> Result<(), Error> {
+        expect_invalid(ProtocolId::new("/libp2p cat/1.0.0".to_owned()))
     }
 
     #[test]
-    fn rejects_control_characters() {
-        let r = ProtocolId::new("/libp2p\n".to_owned());
-        assert!(matches!(r, Err(Error::InvalidProtocolId { .. })));
+    fn rejects_control_characters() -> Result<(), Error> {
+        expect_invalid(ProtocolId::new("/libp2p\n".to_owned()))
     }
 
     #[test]
     fn try_from_str_works() -> Result<(), Error> {
         let p: ProtocolId = "/x/1".try_into()?;
-        assert_eq!(p.as_str(), "/x/1");
-        Ok(())
+        check(p.as_str() == "/x/1", || {
+            format!("unexpected stored name: {}", p.as_str())
+        })
     }
 }

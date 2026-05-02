@@ -182,33 +182,58 @@ mod tests {
         WirePiece::new((), piece, ())
     }
 
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::PubsubProtocol { reason: reason() })
+        }
+    }
+
+    fn expect_pubsub_rejection<T>(outcome: Result<T, Error>) -> Result<(), Error> {
+        match outcome {
+            Err(Error::PubsubProtocol { .. }) => Ok(()),
+            Err(other) => Err(Error::PubsubProtocol {
+                reason: format!("expected PubsubProtocol, got error {other:?}"),
+            }),
+            Ok(_) => Err(Error::PubsubProtocol {
+                reason: "expected PubsubProtocol, got Ok".to_owned(),
+            }),
+        }
+    }
+
     #[test]
     fn encode_decode_round_trip() -> Result<(), Error> {
         let topic: Topic = "/chat/v1".try_into()?;
         let wp = sample_wire_piece();
         let bytes = encode(&topic, 3, 4, &wp)?;
         let (frame, decoded) = decode(&bytes)?;
-        assert_eq!(frame.topic, topic);
-        assert_eq!(frame.piece_count, 3);
-        assert_eq!(frame.piece_byte_len, 4);
-        assert_eq!(decoded.piece(), wp.piece());
-        Ok(())
+        check(frame.topic == topic, || {
+            format!("topic mismatch: {}", frame.topic)
+        })?;
+        check(frame.piece_count == 3, || {
+            format!("piece_count mismatch: {}", frame.piece_count)
+        })?;
+        check(frame.piece_byte_len == 4, || {
+            format!("piece_byte_len mismatch: {}", frame.piece_byte_len)
+        })?;
+        check(decoded.piece() == wp.piece(), || {
+            "decoded piece does not equal original".to_owned()
+        })
     }
 
     #[test]
-    fn decode_rejects_truncated_header() {
-        let outcome = decode(&[5u8, b'x']);
-        assert!(matches!(outcome, Err(Error::PubsubProtocol { .. })));
+    fn decode_rejects_truncated_header() -> Result<(), Error> {
+        expect_pubsub_rejection(decode(&[5u8, b'x']))
     }
 
     #[test]
-    fn decode_rejects_invalid_topic_bytes() {
+    fn decode_rejects_invalid_topic_bytes() -> Result<(), Error> {
         let bad: Vec<u8> = [3u8, b'a', 0x01, b'b']
             .into_iter()
             .chain([0u8; 8])
             .chain([0u8; 4])
             .collect();
-        let outcome = decode(&bad);
-        assert!(matches!(outcome, Err(Error::PubsubProtocol { .. })));
+        expect_pubsub_rejection(decode(&bad))
     }
 }

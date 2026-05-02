@@ -171,17 +171,28 @@ mod tests {
         UdpAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
     }
 
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::HostState { reason: reason() })
+        }
+    }
+
     #[test]
     fn bind_reports_local_addr() -> Result<(), Error> {
         let transport = UdpTransport::bind(loopback_v4()).run()?;
         let addr = transport.local_addr()?;
         match addr {
             UdpAddr::V4(s) => {
-                assert_eq!(s.ip(), &Ipv4Addr::LOCALHOST);
-                assert_ne!(s.port(), 0);
-                Ok(())
+                check(s.ip() == &Ipv4Addr::LOCALHOST, || {
+                    format!("expected LOCALHOST ip, got {}", s.ip())
+                })?;
+                check(s.port() != 0, || {
+                    "ephemeral port should be non-zero".to_owned()
+                })
             }
-            UdpAddr::V6(_) => Err(Error::InvalidPeerId {
+            UdpAddr::V6(_) => Err(Error::HostState {
                 reason: "loopback v4 bind returned a v6 address".to_owned(),
             }),
         }
@@ -192,14 +203,17 @@ mod tests {
         let transport = UdpTransport::bind_with_limits(loopback_v4(), 16, MAX_UDP_PAYLOAD).run()?;
         let local = transport.local_addr()?;
         let oversized = vec![0u8; 17];
-        let outcome = transport.send(local, oversized).run();
-        assert!(matches!(
-            outcome,
+        match transport.send(local, oversized).run() {
             Err(Error::DatagramTooLarge {
                 attempted: 17,
-                maximum: 16
-            })
-        ));
-        Ok(())
+                maximum: 16,
+            }) => Ok(()),
+            Err(other) => Err(Error::HostState {
+                reason: format!("expected DatagramTooLarge {{17,16}}, got error {other:?}"),
+            }),
+            Ok(_) => Err(Error::HostState {
+                reason: "expected DatagramTooLarge, got Ok".to_owned(),
+            }),
+        }
     }
 }

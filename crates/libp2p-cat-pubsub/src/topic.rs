@@ -84,35 +84,47 @@ impl TryFrom<String> for Topic {
 mod tests {
     use super::*;
 
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::PubsubProtocol { reason: reason() })
+        }
+    }
+
+    fn expect_pubsub_rejection(outcome: Result<Topic, Error>) -> Result<(), Error> {
+        match outcome {
+            Err(Error::PubsubProtocol { .. }) => Ok(()),
+            Err(other) => Err(Error::PubsubProtocol {
+                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
+            }),
+            Ok(t) => Err(Error::PubsubProtocol {
+                reason: format!("expected rejection, got Ok({t})"),
+            }),
+        }
+    }
+
     #[test]
     fn accepts_typical_topic() -> Result<(), Error> {
         let t: Topic = "/chat/v1".try_into()?;
-        assert_eq!(t.as_str(), "/chat/v1");
-        Ok(())
+        check(t.as_str() == "/chat/v1", || {
+            format!("unexpected stored name: {}", t.as_str())
+        })
     }
 
     #[test]
-    fn rejects_empty() {
-        assert!(matches!(
-            Topic::new(String::new()),
-            Err(Error::PubsubProtocol { .. })
-        ));
+    fn rejects_empty() -> Result<(), Error> {
+        expect_pubsub_rejection(Topic::new(String::new()))
     }
 
     #[test]
-    fn rejects_whitespace() {
-        assert!(matches!(
-            Topic::new("hello world".to_owned()),
-            Err(Error::PubsubProtocol { .. })
-        ));
+    fn rejects_whitespace() -> Result<(), Error> {
+        expect_pubsub_rejection(Topic::new("hello world".to_owned()))
     }
 
     #[test]
-    fn rejects_oversized() {
+    fn rejects_oversized() -> Result<(), Error> {
         let oversized = "x".repeat(MAX_TOPIC_LEN + 1);
-        assert!(matches!(
-            Topic::new(oversized),
-            Err(Error::PubsubProtocol { .. })
-        ));
+        expect_pubsub_rejection(Topic::new(oversized))
     }
 }

@@ -1,0 +1,18 @@
+[package]
+name = "libp2p-cat-host"
+description = "Connection-managing host for libp2p-cat-rs: drives Noise XX over UDP and routes plaintext datagrams."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+comp-cat-rs = { workspace = true }
+libp2p-cat-types = { workspace = true }
+libp2p-cat-noise = { workspace = true }
+libp2p-cat-udp = { workspace = true }
+
+[lints]
+workspace = true

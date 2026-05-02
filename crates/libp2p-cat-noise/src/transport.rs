@@ -201,57 +201,59 @@ fn advance_window(window: u64, max_nonce: u64, incoming: u64) -> (u64, u64) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fresh_window_accepts_nonce_zero() {
-        assert!(nonce_acceptable(0, 0, 0).is_ok());
+    fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
+        if cond {
+            Ok(())
+        } else {
+            Err(Error::NoiseProtocol { reason: reason() })
+        }
+    }
+
+    fn expect_replay(outcome: Result<(), Error>, expected_nonce: u64) -> Result<(), Error> {
+        match outcome {
+            Err(Error::NoiseReplay { nonce }) if nonce == expected_nonce => Ok(()),
+            other => Err(Error::NoiseProtocol {
+                reason: format!(
+                    "expected NoiseReplay {{ nonce: {expected_nonce} }}, got {other:?}"
+                ),
+            }),
+        }
     }
 
     #[test]
-    fn replay_after_first_acceptance() {
+    fn fresh_window_accepts_nonce_zero() -> Result<(), Error> {
+        nonce_acceptable(0, 0, 0)
+    }
+
+    #[test]
+    fn replay_after_first_acceptance() -> Result<(), Error> {
         let (window, max) = advance_window(0, 0, 0);
-        assert!(matches!(
-            nonce_acceptable(window, max, 0),
-            Err(Error::NoiseReplay { nonce: 0 })
-        ));
+        expect_replay(nonce_acceptable(window, max, 0), 0)
     }
 
     #[test]
-    fn out_of_order_within_window_is_accepted() {
+    fn out_of_order_within_window_is_accepted() -> Result<(), Error> {
         let (window, max) = advance_window(0, 0, 5);
-        assert!(nonce_acceptable(window, max, 3).is_ok());
+        nonce_acceptable(window, max, 3)?;
         let (window, max) = advance_window(window, max, 3);
-        // Replaying 3 now fails.
-        assert!(matches!(
-            nonce_acceptable(window, max, 3),
-            Err(Error::NoiseReplay { nonce: 3 })
-        ));
-        // Nonce 5 is also a replay.
-        assert!(matches!(
-            nonce_acceptable(window, max, 5),
-            Err(Error::NoiseReplay { nonce: 5 })
-        ));
+        expect_replay(nonce_acceptable(window, max, 3), 3)?;
+        expect_replay(nonce_acceptable(window, max, 5), 5)
     }
 
     #[test]
-    fn way_old_nonce_is_rejected() {
+    fn way_old_nonce_is_rejected() -> Result<(), Error> {
         let (window, max) = advance_window(0, 0, 200);
-        assert!(matches!(
-            nonce_acceptable(window, max, 50),
-            Err(Error::NoiseReplay { nonce: 50 })
-        ));
+        expect_replay(nonce_acceptable(window, max, 50), 50)
     }
 
     #[test]
-    fn jump_beyond_window_clears_lower_bits() {
+    fn jump_beyond_window_clears_lower_bits() -> Result<(), Error> {
         let (window, max) = advance_window(0, 0, 1);
         let (window, max) = advance_window(window, max, 100);
-        assert_eq!(max, 100);
-        // Window should now be just bit 0 set (only nonce 100 known).
-        assert_eq!(window, 1);
-        // Nonce 1 is now too old.
-        assert!(matches!(
-            nonce_acceptable(window, max, 1),
-            Err(Error::NoiseReplay { nonce: 1 })
-        ));
+        check(max == 100, || format!("expected max=100, got {max}"))?;
+        check(window == 1, || {
+            format!("expected window=1, got {window:#b}")
+        })?;
+        expect_replay(nonce_acceptable(window, max, 1), 1)
     }
 }
