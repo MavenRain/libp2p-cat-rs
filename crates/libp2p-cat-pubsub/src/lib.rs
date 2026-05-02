@@ -47,5 +47,5 @@ mod mux;
 mod topic;
 
 pub use codec::{MAX_TOPIC_LEN, PubsubFrame, decode, encode};
-pub use mux::{KIND_APP, KIND_PUBSUB, MuxEvent, PubsubMux};
+pub use mux::{KIND_APP, KIND_PUBSUB, MuxEvent, PubsubMux, unused_relay_rng};
 pub use topic::Topic;

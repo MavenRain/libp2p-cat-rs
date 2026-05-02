@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libp2p_cat_host::Host;
 use libp2p_cat_noise::StaticKeypair;
-use libp2p_cat_pubsub::{MuxEvent, PubsubMux, Topic};
+use libp2p_cat_pubsub::{MuxEvent, PubsubMux, Topic, unused_relay_rng};
 use libp2p_cat_types::{Error, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
 use rlnc_cat_rs::coding::piece::OriginalData;
@@ -85,11 +85,13 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(PubsubMux, PubsubMux), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
-    let (responder, ev) = responder.recv_one(responder_seed).run()?;
+    let (responder, ev) = responder
+        .recv_one(responder_seed, unused_relay_rng())
+        .run()?;
     expect_handshake_progress(ev, initiator_addr)?;
-    let (initiator, ev) = initiator.recv_one([0; 32]).run()?;
+    let (initiator, ev) = initiator.recv_one([0; 32], unused_relay_rng()).run()?;
     expect_handshake_complete(ev, responder_addr)?;
-    let (responder, ev) = responder.recv_one([0; 32]).run()?;
+    let (responder, ev) = responder.recv_one([0; 32], unused_relay_rng()).run()?;
     expect_handshake_complete(ev, initiator_addr)?;
     Ok((initiator, responder))
 }
@@ -104,7 +106,7 @@ fn drain_until_delivery(
     let (mux, events) = (0..n).try_fold(
         (mux, Vec::<MuxEvent>::new()),
         |(mux, events), _| -> Result<(PubsubMux, Vec<MuxEvent>), Error> {
-            let (mux, ev) = mux.recv_one([0; 32]).run()?;
+            let (mux, ev) = mux.recv_one([0; 32], unused_relay_rng()).run()?;
             let next: Vec<MuxEvent> = events.into_iter().chain(core::iter::once(ev)).collect();
             Ok((mux, next))
         },
@@ -115,6 +117,7 @@ fn drain_until_delivery(
             MuxEvent::PubsubDelivered { topic: t, data, .. } if t == *topic => Some(data),
             MuxEvent::PubsubDelivered { .. }
             | MuxEvent::PubsubAbsorbed { .. }
+            | MuxEvent::PubsubRelayed { .. }
             | MuxEvent::AppData { .. }
             | MuxEvent::HandshakeProgress { .. }
             | MuxEvent::HandshakeComplete { .. }
@@ -199,7 +202,7 @@ fn app_data_passes_through_mux() -> Result<(), Error> {
     let (alice, bob) = handshake_pair(alice, bob, alice_addr, bob_addr, [0x10; 32], [0x20; 32])?;
 
     let _alice_after = alice.send_app(bob_addr, b"hello via mux").run()?;
-    let (_bob_after, ev) = bob.recv_one([0; 32]).run()?;
+    let (_bob_after, ev) = bob.recv_one([0; 32], unused_relay_rng()).run()?;
     match ev {
         MuxEvent::AppData { addr, bytes } if addr == alice_addr && bytes == b"hello via mux" => {
             Ok(())
