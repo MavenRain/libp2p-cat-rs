@@ -53,6 +53,22 @@ pub enum Error {
         /// The rejected nonce.
         nonce: u64,
     },
+
+    /// An error from the RLNC encoding / decoding / gossip layer.
+    /// `rlnc-cat-rs` types cannot be wrapped directly here without
+    /// breaking this crate's no-`comp-cat-rs`-dep invariant, so the
+    /// error is stringified at the boundary.
+    RlncLayer {
+        /// Description of the underlying RLNC error.
+        reason: String,
+    },
+
+    /// A pubsub-layer protocol violation: malformed frame, unknown
+    /// peer, unregistered topic, or any other shape mismatch.
+    PubsubProtocol {
+        /// Description of the violation.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -74,6 +90,10 @@ impl fmt::Display for Error {
             Self::NoiseReplay { nonce } => {
                 write!(f, "noise replay or out-of-window datagram: nonce {nonce}")
             }
+            Self::RlncLayer { reason } => write!(f, "rlnc layer error: {reason}"),
+            Self::PubsubProtocol { reason } => {
+                write!(f, "pubsub protocol violation: {reason}")
+            }
         }
     }
 }
@@ -87,7 +107,9 @@ impl std::error::Error for Error {
             | Self::DatagramTooLarge { .. }
             | Self::NoiseDecrypt
             | Self::NoiseProtocol { .. }
-            | Self::NoiseReplay { .. } => None,
+            | Self::NoiseReplay { .. }
+            | Self::RlncLayer { .. }
+            | Self::PubsubProtocol { .. } => None,
         }
     }
 }
