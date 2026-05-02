@@ -8,19 +8,21 @@
 //! # Layering
 //!
 //! ```text
-//! +-------------------------------------+    application protocols
-//! |                                     |
-//! |   libp2p-cat-pubsub  (RLNC gossip)  |    multi-peer broadcast
-//! |   libp2p-cat-host    (connections)  |    dial / send / recv loop
-//! |                                     |
-//! +-------------------------------------+
-//! |   libp2p-cat-noise   (XX + AEAD)    |    pairwise authenticated
-//! |                                     |    transport
-//! +-------------------------------------+
-//! |   libp2p-cat-udp     (datagrams)    |    Io-shaped UDP socket
-//! +-------------------------------------+
-//! |   libp2p-cat-types   (PeerId, etc.) |    pure data
-//! +-------------------------------------+
+//! +-----------------------------------------+   application protocols
+//! |                                         |
+//! |   libp2p-cat-pubsub  (PubsubMux)        |   multiplexed RLNC + raw
+//! |                                         |   app data on one host
+//! |                                         |
+//! +-----------------------------------------+
+//! |   libp2p-cat-host    (connections)      |   dial / send / recv loop
+//! +-----------------------------------------+
+//! |   libp2p-cat-noise   (XX + AEAD)        |   pairwise authenticated
+//! |                                         |   transport
+//! +-----------------------------------------+
+//! |   libp2p-cat-udp     (datagrams)        |   Io-shaped UDP socket
+//! +-----------------------------------------+
+//! |   libp2p-cat-types   (PeerId, etc.)     |   pure data
+//! +-----------------------------------------+
 //! ```
 //!
 //! Each layer's API consumes `self` and returns a new value
@@ -31,14 +33,14 @@
 //!
 //! # Quick tour
 //!
-//! - [`Host`] is the top-level handle: dial a peer, run a recv loop,
-//!   send authenticated plaintext.  The `examples/chat` binary in
-//!   the workspace demonstrates a full two-peer chat session built
-//!   from this single type.
-//! - [`PubsubNode`] adds RLNC-coded multicast on top of a peer table
-//!   that mirrors what the host maintains internally.  Today pubsub
-//!   owns its own socket; layering it on top of [`Host`] is the next
-//!   architectural step.
+//! - [`Host`] is the connection-management handle: dial a peer, run a
+//!   recv loop, send authenticated plaintext.  The `examples/chat`
+//!   binary in the workspace demonstrates a full two-peer chat
+//!   session built from this single type.
+//! - [`PubsubMux`] wraps a [`Host`] and multiplexes raw application
+//!   bytes ([`KIND_APP`]) and RLNC-coded pubsub frames
+//!   ([`KIND_PUBSUB`]) onto the same authenticated socket.  Use this
+//!   when one node needs both broadcast and chat-style traffic.
 //! - The lower-level building blocks ([`UdpTransport`],
 //!   [`Initiator`] / [`Responder`], [`TransportState`], [`PeerId`])
 //!   are re-exported here so callers building bespoke nodes can drop
@@ -56,7 +58,7 @@ pub use libp2p_cat_noise::{
     TRANSPORT_OVERHEAD, TransportState,
 };
 pub use libp2p_cat_pubsub::{
-    DeliveredMessage, MAX_TOPIC_LEN, PeerTable, PubsubFrame, PubsubNode, Topic,
+    KIND_APP, KIND_PUBSUB, MAX_TOPIC_LEN, MuxEvent, PubsubFrame, PubsubMux, Topic,
     decode as decode_pubsub_frame, encode as encode_pubsub_frame,
 };
 pub use libp2p_cat_types::{Error, MAX_INLINE_KEY_BYTES, PeerId, ProtocolId, UdpAddr};

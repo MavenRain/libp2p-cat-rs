@@ -1,6 +1,6 @@
 [package]
 name = "libp2p-cat-pubsub"
-description = "RLNC-coded pubsub on top of libp2p-cat-udp + libp2p-cat-noise."
+description = "RLNC-coded pubsub layered on top of libp2p-cat-host."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,9 @@ comp-cat-rs = { workspace = true }
 rlnc-cat-rs = { workspace = true }
 libp2p-cat-types = { workspace = true }
 libp2p-cat-noise = { workspace = true }
+libp2p-cat-host = { workspace = true }
+
+[dev-dependencies]
 libp2p-cat-udp = { workspace = true }
 
 [lints]

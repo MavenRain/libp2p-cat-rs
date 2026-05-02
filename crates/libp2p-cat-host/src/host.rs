@@ -88,6 +88,16 @@ impl Host {
         self.established.get(&addr).map(|conn| &conn.remote_static)
     }
 
+    /// A snapshot of every peer address with an established
+    /// post-handshake transport.
+    ///
+    /// Useful for layers above the host (e.g. pubsub broadcast
+    /// fan-out) that need to enumerate active connections.
+    #[must_use]
+    pub fn established_addrs(&self) -> Vec<UdpAddr> {
+        self.established.keys().copied().collect()
+    }
+
     /// Initiate a Noise XX handshake with the peer at `addr`.
     ///
     /// Sends `msg1` over the wire and stores the `InitiatorAfterE`
