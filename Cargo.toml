@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/libp2p-cat-types",
     "crates/libp2p-cat-udp",
+    "crates/libp2p-cat-noise",
 ]
 
 [workspace.package]
@@ -19,8 +20,12 @@ categories = ["network-programming", "rust-patterns"]
 [workspace.dependencies]
 comp-cat-rs = "0.5"
 rlnc-cat-rs = "0.2"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 libp2p-cat-types = { path = "crates/libp2p-cat-types", version = "0.1.0" }
 libp2p-cat-udp = { path = "crates/libp2p-cat-udp", version = "0.1.0" }
+libp2p-cat-noise = { path = "crates/libp2p-cat-noise", version = "0.1.0" }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

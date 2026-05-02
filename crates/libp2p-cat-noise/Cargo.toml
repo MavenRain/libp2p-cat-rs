@@ -1,0 +1,18 @@
+[package]
+name = "libp2p-cat-noise"
+description = "Noise XX over X25519 / ChaCha20-Poly1305 / BLAKE3 for libp2p-cat-rs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true }
+libp2p-cat-types = { workspace = true }
+
+[lints]
+workspace = true

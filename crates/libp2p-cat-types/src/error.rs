@@ -32,6 +32,27 @@ pub enum Error {
         /// The configured maximum, in bytes.
         maximum: usize,
     },
+
+    /// A Noise handshake or transport message could not be authenticated
+    /// or decrypted.  Carries no detail by design: the AEAD failure
+    /// reason is uniformly "tag mismatch" and any leak of additional
+    /// state risks giving an attacker an oracle.
+    NoiseDecrypt,
+
+    /// A Noise message violated the protocol: wrong length, wrong
+    /// state, or malformed token sequence.
+    NoiseProtocol {
+        /// Description of the violation.
+        reason: String,
+    },
+
+    /// A Noise transport datagram was rejected by the replay window:
+    /// either the nonce was below the window's lower edge, or it had
+    /// already been seen.
+    NoiseReplay {
+        /// The rejected nonce.
+        nonce: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -48,6 +69,11 @@ impl fmt::Display for Error {
                 f,
                 "datagram too large: attempted {attempted} bytes, maximum {maximum}"
             ),
+            Self::NoiseDecrypt => f.write_str("noise decryption failed"),
+            Self::NoiseProtocol { reason } => write!(f, "noise protocol violation: {reason}"),
+            Self::NoiseReplay { nonce } => {
+                write!(f, "noise replay or out-of-window datagram: nonce {nonce}")
+            }
         }
     }
 }
@@ -58,7 +84,10 @@ impl std::error::Error for Error {
             Self::Io(e) => Some(e),
             Self::InvalidProtocolId { .. }
             | Self::InvalidPeerId { .. }
-            | Self::DatagramTooLarge { .. } => None,
+            | Self::DatagramTooLarge { .. }
+            | Self::NoiseDecrypt
+            | Self::NoiseProtocol { .. }
+            | Self::NoiseReplay { .. } => None,
         }
     }
 }
