@@ -21,8 +21,9 @@
 //! ```
 //!
 //! after the kind byte.  The `commitment` and `tag` widths come from
-//! the [`WireAuthenticator`] in use; for [`rlnc_cat_rs::auth::NullAuthenticator`]
-//! both are zero bytes, so the format collapses to its earlier shape.
+//! the [`WireAuthenticator`] in use, which parses each block in
+//! cursor style; for [`rlnc_cat_rs::auth::NullAuthenticator`] both
+//! are zero bytes, so the format collapses to its earlier shape.
 //! Piece bytes are produced by
 //! [`rlnc_cat_rs::coding::piece::CodedPiece::to_bytes`] and parsed
 //! back via `CodedPiece::from_bytes(_, piece_count)`; the `(k, b)`
@@ -35,14 +36,19 @@
 //!   [`PubsubMux::broadcast`], [`PubsubMux::register_topic`], and
 //!   [`PubsubMux::register_relay`] respectively.
 //! - **Pluggable authenticators** via the [`WireAuthenticator`] /
-//!   [`PubsubAuth`] traits.  Stock impls cover
-//!   [`rlnc_cat_rs::auth::NullAuthenticator`] (no auth, zero wire
-//!   overhead) and [`rlnc_cat_rs::auth::KeyedHashAuthenticator`]
-//!   (32-byte commitment + 32-byte BLAKE3-keyed-hash tag).  The
-//!   keyed-hash construction is **not homomorphic**: a relay needs
-//!   the shared key to verify inbound pieces and re-tag the recoded
-//!   outbound pieces.  Suitable for permissioned networks; future
-//!   homomorphic-signature impls will lift that constraint.
+//!   [`PubsubAuth`] traits.  Three stock impls are provided:
+//!     - [`rlnc_cat_rs::auth::NullAuthenticator`]: no auth, zero wire
+//!       overhead.
+//!     - [`rlnc_cat_rs::auth::KeyedHashAuthenticator`]: 32-byte
+//!       commitment + 32-byte BLAKE3-keyed-hash tag.  Not homomorphic:
+//!       a relay needs the shared key to re-tag recoded pieces, so
+//!       this fits permissioned networks.
+//!     - [`rlnc_cat_rs::lhs::LatticeHomomorphicAuthenticator`]:
+//!       32-byte BLAKE3-fingerprint commitment + length-prefixed
+//!       `Z^m` signature.  *Homomorphic*: a relay holding only the
+//!       public transcript `(pk, metadata, σ_originals)` can re-tag
+//!       recoded pieces without the source's secret key, so this
+//!       fits open / public-relay deployments.
 //! - **One generation per topic**: when a topic decodes successfully
 //!   the corresponding decoder is consumed; callers re-register the
 //!   topic to receive another generation.

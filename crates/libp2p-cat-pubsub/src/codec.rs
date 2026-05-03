@@ -11,11 +11,15 @@
 //! +-------------+--------------+-------------+-------------+--------------+--------+--------------+
 //! ```
 //!
-//! `commitment` and `tag` widths are fixed by the
-//! [`WireAuthenticator`] in use:
-//! [`rlnc_cat_rs::auth::NullAuthenticator`] uses zero bytes for
-//! both, while
-//! [`rlnc_cat_rs::auth::KeyedHashAuthenticator`] uses 32 bytes each.
+//! `commitment` and `tag` widths come from the
+//! [`WireAuthenticator`] in use, which parses each block in cursor
+//! style and reports the number of bytes it consumed:
+//! [`rlnc_cat_rs::auth::NullAuthenticator`] consumes zero bytes for
+//! both, [`rlnc_cat_rs::auth::KeyedHashAuthenticator`] consumes 32
+//! bytes for each, and
+//! [`rlnc_cat_rs::lhs::authenticator::LatticeHomomorphicAuthenticator`]
+//! consumes 32 bytes for the commitment and a 4-byte BE length
+//! prefix plus 8 bytes per `Z`-entry for the tag.
 //!
 //! Piece bytes are produced by [`CodedPiece::to_bytes`] and parsed
 //! by `CodedPiece::from_bytes(_, piece_count)`; the `(k, b)`
@@ -119,11 +123,11 @@ where
             reason: "frame missing topic length byte".to_owned(),
         })?;
     let topic_len = usize::from(topic_len_byte);
-    let header_end = 1 + topic_len + KB_LEN + A::COMMITMENT_LEN + A::TAG_LEN;
-    if bytes.len() < header_end {
+    let fixed_header_end = 1 + topic_len + KB_LEN;
+    if bytes.len() < fixed_header_end {
         Err(Error::PubsubProtocol {
             reason: format!(
-                "frame too short: {} bytes, header needs {header_end}",
+                "frame too short for fixed header: {} bytes, need {fixed_header_end}",
                 bytes.len()
             ),
         })
@@ -152,25 +156,21 @@ where
             })?;
         let piece_count = u32::from_be_bytes(parse_4(k_slice)?);
         let piece_byte_len = u32::from_be_bytes(parse_4(b_slice)?);
-        let auth_block_start = 1 + topic_len + KB_LEN;
-        let commitment_end = auth_block_start + A::COMMITMENT_LEN;
-        let tag_end = commitment_end + A::TAG_LEN;
-        let commitment_slice =
-            bytes
-                .get(auth_block_start..commitment_end)
+        let auth_buffer = bytes
+            .get(fixed_header_end..)
+            .ok_or_else(|| Error::PubsubProtocol {
+                reason: "frame missing auth block".to_owned(),
+            })?;
+        let (commitment, commitment_consumed) = A::commitment_from_bytes(auth_buffer)?;
+        let after_commitment =
+            auth_buffer
+                .get(commitment_consumed..)
                 .ok_or_else(|| Error::PubsubProtocol {
-                    reason: "frame missing commitment bytes".to_owned(),
+                    reason: "frame missing tag block after commitment".to_owned(),
                 })?;
-        let tag_slice =
-            bytes
-                .get(commitment_end..tag_end)
-                .ok_or_else(|| Error::PubsubProtocol {
-                    reason: "frame missing tag bytes".to_owned(),
-                })?;
-        let commitment = A::commitment_from_bytes(commitment_slice)?;
-        let tag = A::tag_from_bytes(tag_slice)?;
-        let piece_bytes = bytes
-            .get(header_end..)
+        let (tag, tag_consumed) = A::tag_from_bytes(after_commitment)?;
+        let piece_bytes = after_commitment
+            .get(tag_consumed..)
             .ok_or_else(|| Error::PubsubProtocol {
                 reason: "frame missing piece body".to_owned(),
             })?

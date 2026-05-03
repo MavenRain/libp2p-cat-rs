@@ -39,6 +39,15 @@ cargo run -p libp2p-cat-rs-example-chat -- 127.0.0.1:4001
 cargo run -p libp2p-cat-rs-example-chat -- 127.0.0.1:4002 127.0.0.1:4001
 ```
 
+`PubsubMux` is generic over an authenticator that implements
+`WireAuthenticator`.  Three stock impls ship in `libp2p-cat-pubsub`:
+
+| Authenticator                       | Wire overhead per piece          | Relay model                |
+| ----------------------------------- | -------------------------------- | -------------------------- |
+| `NullAuthenticator`                 | 0 + 0 bytes                      | trust-the-peer             |
+| `KeyedHashAuthenticator`            | 32 + 32 bytes (BLAKE3-keyed)     | permissioned (shared key)  |
+| `LatticeHomomorphicAuthenticator`   | 32 + 4 + 8·m bytes (`Z^m` sig)   | open (homomorphic re-tag)  |
+
 Future:
 
 | Piece                  | Purpose                                                  |
@@ -46,7 +55,6 @@ Future:
 | `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding via signed-Noise-extension.     |
 | Kademlia DHT           | Peer discovery and content routing.                      |
 | NAT traversal          | Rendezvous-based UDP hole-punching.                      |
-| Authenticators         | KeyedHash / lattice-LHS pubsub (replace `NullAuthenticator`). |
 
 ## Why UDP-only?
 
