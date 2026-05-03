@@ -70,8 +70,8 @@ mod symmetric;
 mod transport;
 
 pub use handshake::{
-    Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_LEN,
-    MESSAGE_3_LEN, Responder, ResponderAfterE, ResponderAfterResponse,
+    Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_OVERHEAD_LEN,
+    MESSAGE_3_OVERHEAD_LEN, Responder, ResponderAfterE, ResponderAfterResponse,
 };
 pub use primitives::{StaticKeypair, StaticPrivateKey, StaticPublicKey};
 pub use transport::{

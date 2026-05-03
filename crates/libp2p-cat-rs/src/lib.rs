@@ -52,8 +52,8 @@
 
 pub use libp2p_cat_host::{Host, HostEvent};
 pub use libp2p_cat_noise::{
-    Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_LEN,
-    MESSAGE_3_LEN, REPLAY_WINDOW_BITS, Responder, ResponderAfterE, ResponderAfterResponse,
+    Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_OVERHEAD_LEN,
+    MESSAGE_3_OVERHEAD_LEN, REPLAY_WINDOW_BITS, Responder, ResponderAfterE, ResponderAfterResponse,
     StaticKeypair, StaticPrivateKey, StaticPublicKey, TRANSPORT_NONCE_PREFIX_LEN,
     TRANSPORT_OVERHEAD, TransportState,
 };

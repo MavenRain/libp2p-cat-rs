@@ -17,10 +17,10 @@ fn established_pair() -> Result<(TransportState, TransportState), Error> {
     let bob = StaticKeypair::from_private_bytes(BOB_PRIVATE);
     let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
     let bob_after_e = Responder::new(bob).read_e(&msg1)?;
-    let (bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH)?;
-    let alice_after_response = alice_after_e.read_response(&msg2)?;
-    let (alice_transport, msg3, _) = alice_after_response.write_s()?;
-    let (bob_transport, _) = bob_after_response.read_s(&msg3)?;
+    let (bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &[])?;
+    let (alice_after_response, _msg2_payload) = alice_after_e.read_response(&msg2)?;
+    let (alice_transport, msg3, _) = alice_after_response.write_s(&[])?;
+    let (bob_transport, _, _msg3_payload) = bob_after_response.read_s(&msg3)?;
     Ok((alice_transport, bob_transport))
 }
 

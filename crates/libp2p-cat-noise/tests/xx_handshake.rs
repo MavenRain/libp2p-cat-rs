@@ -91,18 +91,31 @@ fn xx_handshake_completes_and_keys_agree() -> Result<(), Error> {
     let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
 
     let bob_after_e = Responder::new(bob).read_e(&msg1)?;
-    let (bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH)?;
+    let (bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &[])?;
 
-    let alice_after_response = alice_after_e.read_response(&msg2)?;
+    let (alice_after_response, msg2_payload) = alice_after_e.read_response(&msg2)?;
+    check(msg2_payload.is_empty(), || {
+        format!(
+            "expected empty msg2 trailer, got {} bytes",
+            msg2_payload.len()
+        )
+    })?;
     check_static_key_eq(
         alice_after_response.remote_static(),
         &bob_pub,
         "initiator after msg2",
     )?;
-    let (alice_transport, msg3, alice_observed_bob_static) = alice_after_response.write_s()?;
+    let (alice_transport, msg3, alice_observed_bob_static) = alice_after_response.write_s(&[])?;
     check_static_key_eq(&alice_observed_bob_static, &bob_pub, "write_s output")?;
 
-    let (bob_transport, bob_observed_alice_static) = bob_after_response.read_s(&msg3)?;
+    let (bob_transport, bob_observed_alice_static, msg3_payload) =
+        bob_after_response.read_s(&msg3)?;
+    check(msg3_payload.is_empty(), || {
+        format!(
+            "expected empty msg3 trailer, got {} bytes",
+            msg3_payload.len()
+        )
+    })?;
     check_static_key_eq(
         &bob_observed_alice_static,
         &alice_pub,
@@ -132,10 +145,12 @@ fn xx_rejects_truncated_message_2() -> Result<(), Error> {
     let bob = StaticKeypair::from_private_bytes(BOB_PRIVATE);
     let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
     let bob_after_e = Responder::new(bob).read_e(&msg1)?;
-    let (_bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH)?;
+    let (_bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &[])?;
 
+    // Truncating below MESSAGE_2_OVERHEAD_LEN (96 bytes for empty
+    // payload) must trip the length check.
     let truncated = msg2
-        .get(..msg2.len() - 1)
+        .get(..libp2p_cat_noise::MESSAGE_2_OVERHEAD_LEN - 1)
         .map(<[u8]>::to_vec)
         .unwrap_or_default();
     expect_noise_protocol(alice_after_e.read_response(&truncated))
@@ -147,7 +162,7 @@ fn xx_rejects_tampered_message_2() -> Result<(), Error> {
     let bob = StaticKeypair::from_private_bytes(BOB_PRIVATE);
     let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
     let bob_after_e = Responder::new(bob).read_e(&msg1)?;
-    let (_bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH)?;
+    let (_bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &[])?;
 
     // Flip the last byte of the encrypted-static segment.
     let tampered: Vec<u8> = msg2
@@ -172,12 +187,49 @@ fn xx_initiator_sees_bob_public_before_writing_message_3() -> Result<(), Error> 
 
     let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
     let bob_after_e = Responder::new(bob).read_e(&msg1)?;
-    let (_bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH)?;
-    let alice_after_response = alice_after_e.read_response(&msg2)?;
+    let (_bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &[])?;
+    let (alice_after_response, _payload) = alice_after_e.read_response(&msg2)?;
 
     check_static_key_eq(
         alice_after_response.remote_static(),
         &bob_pub,
         "initiator should authenticate bob before msg3",
     )
+}
+
+#[test]
+fn xx_round_trips_non_empty_trailer_payloads() -> Result<(), Error> {
+    // Exercise the payload slots in messages 2 and 3.  Bob sends a
+    // 96-byte (SignedStaticKey-shaped) blob with msg2; Alice sends a
+    // distinct 64-byte blob with msg3.  Both sides see exactly what
+    // the other side sent.
+    let alice = StaticKeypair::from_private_bytes(ALICE_PRIVATE);
+    let bob = StaticKeypair::from_private_bytes(BOB_PRIVATE);
+
+    let bob_payload: Vec<u8> = (0..96u8).collect();
+    let alice_payload: Vec<u8> = (100..164u8).collect();
+
+    let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
+    let bob_after_e = Responder::new(bob).read_e(&msg1)?;
+    let (bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &bob_payload)?;
+    let (alice_after_response, alice_received_msg2_payload) = alice_after_e.read_response(&msg2)?;
+    check(alice_received_msg2_payload == bob_payload, || {
+        format!(
+            "msg2 payload round-trip mismatch: sent {} bytes, got {} bytes",
+            bob_payload.len(),
+            alice_received_msg2_payload.len()
+        )
+    })?;
+
+    let (_alice_transport, msg3, _bob_static_again) =
+        alice_after_response.write_s(&alice_payload)?;
+    let (_bob_transport, _alice_static_again, bob_received_msg3_payload) =
+        bob_after_response.read_s(&msg3)?;
+    check(bob_received_msg3_payload == alice_payload, || {
+        format!(
+            "msg3 payload round-trip mismatch: sent {} bytes, got {} bytes",
+            alice_payload.len(),
+            bob_received_msg3_payload.len()
+        )
+    })
 }

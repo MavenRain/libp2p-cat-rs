@@ -6,9 +6,15 @@
 //!
 //! # Wire-format constants
 //!
+//! Messages 2 and 3 carry an encrypted, AEAD-authenticated trailer
+//! payload of arbitrary length `n` (typically 0 for unauthenticated
+//! Noise XX, or 96 bytes for a `libp2p-cat-identity::SignedStaticKey`).
+//!
 //! - Message 1 (initiator → responder): 32 bytes — `e`.
-//! - Message 2 (responder → initiator): 96 bytes — `e || enc(s) || enc(empty payload)`.
-//! - Message 3 (initiator → responder): 64 bytes — `enc(s) || enc(empty payload)`.
+//! - Message 2 (responder → initiator): `MESSAGE_2_OVERHEAD_LEN + n`
+//!   bytes — `e || enc(s) || enc(payload)`.
+//! - Message 3 (initiator → responder): `MESSAGE_3_OVERHEAD_LEN + n`
+//!   bytes — `enc(s) || enc(payload)`.
 //!
 //! # Token interpretation
 //!
@@ -38,17 +44,22 @@ const EPH_PUBLIC_LEN: usize = KEY_LEN;
 /// Length of an encrypted-and-tagged static public key on the wire.
 const ENC_STATIC_LEN: usize = KEY_LEN + AEAD_TAG_LEN;
 
-/// Length of an encrypted empty-payload trailer (just the AEAD tag).
-const ENC_EMPTY_PAYLOAD_LEN: usize = AEAD_TAG_LEN;
-
 /// Wire length of the first handshake message (initiator → responder).
+///
+/// Message 1 has no payload slot; the value is fixed.
 pub const MESSAGE_1_LEN: usize = EPH_PUBLIC_LEN;
 
-/// Wire length of the second handshake message (responder → initiator).
-pub const MESSAGE_2_LEN: usize = EPH_PUBLIC_LEN + ENC_STATIC_LEN + ENC_EMPTY_PAYLOAD_LEN;
+/// Fixed overhead of the second handshake message
+/// (responder → initiator): `e || enc(s) || AEAD-tag`.  Total wire
+/// length is `MESSAGE_2_OVERHEAD_LEN + payload.len()`.  Equal to the
+/// total length when the trailer payload is empty.
+pub const MESSAGE_2_OVERHEAD_LEN: usize = EPH_PUBLIC_LEN + ENC_STATIC_LEN + AEAD_TAG_LEN;
 
-/// Wire length of the third handshake message (initiator → responder).
-pub const MESSAGE_3_LEN: usize = ENC_STATIC_LEN + ENC_EMPTY_PAYLOAD_LEN;
+/// Fixed overhead of the third handshake message
+/// (initiator → responder): `enc(s) || AEAD-tag`.  Total wire
+/// length is `MESSAGE_3_OVERHEAD_LEN + payload.len()`.  Equal to the
+/// total length when the trailer payload is empty.
+pub const MESSAGE_3_OVERHEAD_LEN: usize = ENC_STATIC_LEN + AEAD_TAG_LEN;
 
 // ---------------------------------------------------------------------------
 // Initiator
@@ -120,17 +131,27 @@ impl InitiatorAfterE {
     ///
     /// On success returns an [`InitiatorAfterResponse`] from which the
     /// remote static public key can be inspected before the final
-    /// outbound message is written.
+    /// outbound message is written, plus the decrypted trailer
+    /// payload (empty for unauthenticated XX, or a 96-byte
+    /// `SignedStaticKey` payload when running with the identity
+    /// extension).
     ///
     /// # Errors
     ///
-    /// - [`Error::NoiseProtocol`] if `msg.len()` is not exactly
-    ///   [`MESSAGE_2_LEN`] or any internal slice fails to parse.
+    /// - [`Error::NoiseProtocol`] if `msg.len()` is below
+    ///   [`MESSAGE_2_OVERHEAD_LEN`] or any internal slice fails to
+    ///   parse.
     /// - [`Error::NoiseDecrypt`] if the AEAD on the encrypted static
     ///   key or the trailing payload fails to authenticate.
-    pub fn read_response(self, msg: &[u8]) -> Result<InitiatorAfterResponse, Error> {
+    pub fn read_response(self, msg: &[u8]) -> Result<(InitiatorAfterResponse, Vec<u8>), Error> {
         let total_len = msg.len();
-        if total_len == MESSAGE_2_LEN {
+        if total_len < MESSAGE_2_OVERHEAD_LEN {
+            Err(Error::NoiseProtocol {
+                reason: format!(
+                    "expected at least {MESSAGE_2_OVERHEAD_LEN}-byte handshake message 2, got {total_len}"
+                ),
+            })
+        } else {
             let e_slice = msg
                 .get(0..EPH_PUBLIC_LEN)
                 .ok_or_else(|| protocol_error("missing remote ephemeral"))?;
@@ -150,20 +171,17 @@ impl InitiatorAfterE {
             let remote_static = StaticPublicKey::from_bytes(parse_32(&remote_static_plain)?);
             // es: dh(initiator_e, responder_s) — initiator side: dh_es(own_eph, remote_static)
             let sym = sym.mix_key(&dh_es(&self.eph_private, &remote_static));
-            // empty payload trailer
-            let (sym, _empty) = sym.decrypt_and_hash(enc_payload_slice)?;
-            Ok(InitiatorAfterResponse {
-                static_keypair: self.static_keypair,
-                remote_eph,
-                remote_static,
-                sym,
-            })
-        } else {
-            Err(Error::NoiseProtocol {
-                reason: format!(
-                    "expected {MESSAGE_2_LEN}-byte handshake message 2, got {total_len}"
-                ),
-            })
+            // payload trailer (may be empty)
+            let (sym, payload) = sym.decrypt_and_hash(enc_payload_slice)?;
+            Ok((
+                InitiatorAfterResponse {
+                    static_keypair: self.static_keypair,
+                    remote_eph,
+                    remote_static,
+                    sym,
+                },
+                payload,
+            ))
         }
     }
 }
@@ -188,21 +206,29 @@ impl InitiatorAfterResponse {
     /// Write the third handshake message (tokens: `s, se`) and
     /// transition into the post-handshake transport state.
     ///
+    /// `payload` is the encrypted, authenticated trailer.  Pass `&[]`
+    /// for unauthenticated XX, or the wire bytes of a
+    /// `libp2p-cat-identity::SignedStaticKey` to bind this side's
+    /// X25519 static key to its Ed25519 identity.
+    ///
     /// Returns the [`TransportState`], the on-wire bytes, and the
     /// remote's authenticated static public key.
     ///
     /// # Errors
     ///
     /// - [`Error::NoiseDecrypt`] if AEAD encryption fails.
-    pub fn write_s(self) -> Result<(TransportState, Vec<u8>, StaticPublicKey), Error> {
+    pub fn write_s(
+        self,
+        payload: &[u8],
+    ) -> Result<(TransportState, Vec<u8>, StaticPublicKey), Error> {
         // s
         let (sym, enc_static) = self
             .sym
             .encrypt_and_hash(self.static_keypair.public().as_bytes())?;
         // se: dh(initiator_s, responder_e) — initiator side: dh_se(own_static, remote_eph)
         let sym = sym.mix_key(&dh_se(self.static_keypair.private(), &self.remote_eph));
-        // empty payload trailer
-        let (sym, enc_payload) = sym.encrypt_and_hash(&[])?;
+        // payload trailer (may be empty)
+        let (sym, enc_payload) = sym.encrypt_and_hash(payload)?;
         let (initiator_to_responder, responder_to_initiator) = sym.split();
         let transport = TransportState::new(initiator_to_responder, responder_to_initiator);
         let msg: Vec<u8> = enc_static.into_iter().chain(enc_payload).collect();
@@ -274,7 +300,11 @@ pub struct ResponderAfterE {
 impl ResponderAfterE {
     /// Write the responder's reply (tokens: `e, ee, s, es`).
     ///
-    /// `ephemeral_seed` is 32 bytes from a CSPRNG.
+    /// `ephemeral_seed` is 32 bytes from a CSPRNG.  `payload` is the
+    /// encrypted, authenticated trailer; pass `&[]` for
+    /// unauthenticated XX, or the wire bytes of a
+    /// `libp2p-cat-identity::SignedStaticKey` to bind this side's
+    /// X25519 static key to its Ed25519 identity.
     ///
     /// # Errors
     ///
@@ -282,6 +312,7 @@ impl ResponderAfterE {
     pub fn write_response(
         self,
         ephemeral_seed: [u8; KEY_LEN],
+        payload: &[u8],
     ) -> Result<(ResponderAfterResponse, Vec<u8>), Error> {
         let eph_private = EphemeralPrivateKey::from_seed(ephemeral_seed);
         let eph_public = eph_private.public();
@@ -293,8 +324,8 @@ impl ResponderAfterE {
         let (sym, enc_static) = sym.encrypt_and_hash(self.static_keypair.public().as_bytes())?;
         // es: dh(initiator_e, responder_s) — responder side: dh_se(own_static, remote_eph)
         let sym = sym.mix_key(&dh_se(self.static_keypair.private(), &self.remote_eph));
-        // empty payload trailer
-        let (sym, enc_payload) = sym.encrypt_and_hash(&[])?;
+        // payload trailer (may be empty)
+        let (sym, enc_payload) = sym.encrypt_and_hash(payload)?;
         let msg: Vec<u8> = eph_public
             .as_bytes()
             .iter()
@@ -317,16 +348,25 @@ impl ResponderAfterResponse {
     /// Read the initiator's final message (tokens: `s, se`) and
     /// transition into the post-handshake transport state.
     ///
-    /// Returns the [`TransportState`] and the initiator's
-    /// authenticated static public key.
+    /// Returns the [`TransportState`], the initiator's authenticated
+    /// static public key, and the decrypted trailer payload (empty
+    /// for unauthenticated XX, or a 96-byte `SignedStaticKey` payload
+    /// when running with the identity extension).
     ///
     /// # Errors
     ///
-    /// - [`Error::NoiseProtocol`] if `msg.len()` is not [`MESSAGE_3_LEN`].
+    /// - [`Error::NoiseProtocol`] if `msg.len()` is below
+    ///   [`MESSAGE_3_OVERHEAD_LEN`].
     /// - [`Error::NoiseDecrypt`] if AEAD authentication fails.
-    pub fn read_s(self, msg: &[u8]) -> Result<(TransportState, StaticPublicKey), Error> {
+    pub fn read_s(self, msg: &[u8]) -> Result<(TransportState, StaticPublicKey, Vec<u8>), Error> {
         let total_len = msg.len();
-        if total_len == MESSAGE_3_LEN {
+        if total_len < MESSAGE_3_OVERHEAD_LEN {
+            Err(Error::NoiseProtocol {
+                reason: format!(
+                    "expected at least {MESSAGE_3_OVERHEAD_LEN}-byte handshake message 3, got {total_len}"
+                ),
+            })
+        } else {
             let enc_static_slice = msg
                 .get(0..ENC_STATIC_LEN)
                 .ok_or_else(|| protocol_error("missing encrypted static"))?;
@@ -338,18 +378,12 @@ impl ResponderAfterResponse {
             let remote_static = StaticPublicKey::from_bytes(parse_32(&remote_static_plain)?);
             // se: dh(initiator_s, responder_e) — responder side: dh_es(own_eph, remote_static)
             let sym = sym.mix_key(&dh_es(&self.eph_private, &remote_static));
-            // empty payload trailer
-            let (sym, _empty) = sym.decrypt_and_hash(enc_payload_slice)?;
+            // payload trailer (may be empty)
+            let (sym, payload) = sym.decrypt_and_hash(enc_payload_slice)?;
             let (initiator_to_responder, responder_to_initiator) = sym.split();
             // Responder sends r->i and receives i->r.
             let transport = TransportState::new(responder_to_initiator, initiator_to_responder);
-            Ok((transport, remote_static))
-        } else {
-            Err(Error::NoiseProtocol {
-                reason: format!(
-                    "expected {MESSAGE_3_LEN}-byte handshake message 3, got {total_len}"
-                ),
-            })
+            Ok((transport, remote_static, payload))
         }
     }
 }

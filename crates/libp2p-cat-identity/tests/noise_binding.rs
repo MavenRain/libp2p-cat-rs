@@ -53,10 +53,11 @@ fn complete_handshake(
 
     let (initiator, msg1) = initiator.write_e(initiator_eph_seed)?;
     let responder = responder.read_e(&msg1)?;
-    let (responder, msg2) = responder.write_response(responder_eph_seed)?;
-    let initiator = initiator.read_response(&msg2)?;
-    let (initiator_transport, msg3, initiator_observed_responder) = initiator.write_s()?;
-    let (responder_transport, responder_observed_initiator) = responder.read_s(&msg3)?;
+    let (responder, msg2) = responder.write_response(responder_eph_seed, &[])?;
+    let (initiator, _msg2_payload) = initiator.read_response(&msg2)?;
+    let (initiator_transport, msg3, initiator_observed_responder) = initiator.write_s(&[])?;
+    let (responder_transport, responder_observed_initiator, _msg3_payload) =
+        responder.read_s(&msg3)?;
     Ok((
         initiator_transport,
         responder_transport,

@@ -419,7 +419,7 @@ fn initiator_consume_msg2(
 ) -> Io<Error, (Host, HostEvent)> {
     let result = after_e
         .read_response(datagram)
-        .and_then(libp2p_cat_noise::InitiatorAfterResponse::write_s);
+        .and_then(|(after_resp, _msg2_payload)| after_resp.write_s(&[]));
     match result {
         Ok((transport, msg3, remote_static)) => socket.send(from, msg3).map(move |socket| {
             let mut established = established;
@@ -458,7 +458,7 @@ fn responder_consume_msg3(
     datagram: &[u8],
 ) -> Io<Error, (Host, HostEvent)> {
     match after_resp.read_s(datagram) {
-        Ok((transport, remote_static)) => {
+        Ok((transport, remote_static, _msg3_payload)) => {
             established.insert(
                 from,
                 EstablishedConnection {
@@ -497,7 +497,7 @@ fn try_responder_msg1(
         let responder = Responder::new(static_keypair.clone());
         match responder
             .read_e(datagram)
-            .and_then(|after_e| after_e.write_response(ephemeral_seed))
+            .and_then(|after_e| after_e.write_response(ephemeral_seed, &[]))
         {
             Ok((after_resp, msg2)) => socket.send(from, msg2).map(move |socket| {
                 let mut handshakes = handshakes;
