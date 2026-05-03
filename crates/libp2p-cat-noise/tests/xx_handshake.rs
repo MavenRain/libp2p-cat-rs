@@ -37,7 +37,17 @@ fn check_static_key_eq(
 fn expect_noise_protocol<T>(outcome: Result<T, Error>) -> Result<(), Error> {
     match outcome {
         Err(Error::NoiseProtocol { .. }) => Ok(()),
-        Err(other) => Err(Error::NoiseProtocol {
+        Err(
+            other @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseDecrypt
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }),
+        ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseProtocol, got error {other:?}"),
         }),
         Ok(_) => Err(Error::NoiseProtocol {
@@ -49,7 +59,17 @@ fn expect_noise_protocol<T>(outcome: Result<T, Error>) -> Result<(), Error> {
 fn expect_noise_decrypt<T>(outcome: Result<T, Error>) -> Result<(), Error> {
     match outcome {
         Err(Error::NoiseDecrypt) => Ok(()),
-        Err(other) => Err(Error::NoiseProtocol {
+        Err(
+            other @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseProtocol { .. }
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }),
+        ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseDecrypt, got error {other:?}"),
         }),
         Ok(_) => Err(Error::NoiseProtocol {

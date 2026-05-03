@@ -20,7 +20,10 @@ use libp2p_cat_noise::StaticKeypair;
 use libp2p_cat_pubsub::{MuxEvent, PubsubMux, Topic, unused_relay_rng};
 use libp2p_cat_types::{Error, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
+use rlnc_cat_rs::auth::NullAuthenticator;
 use rlnc_cat_rs::coding::piece::OriginalData;
+
+type NullMux = PubsubMux<NullAuthenticator>;
 
 fn loopback_v4() -> UdpAddr {
     UdpAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -66,24 +69,25 @@ fn standard_basis_rng()
 }
 
 /// Bind a socket, derive a static keypair from the seed, wrap the
-/// pair in a [`PubsubMux`].
-fn build_mux(seed: u8) -> Result<(PubsubMux, UdpAddr), Error> {
+/// pair in a [`PubsubMux`] with [`NullAuthenticator`].
+fn build_mux(seed: u8) -> Result<(NullMux, UdpAddr), Error> {
     let socket = UdpTransport::bind(loopback_v4()).run()?;
     let addr = socket.local_addr()?;
     let keypair = StaticKeypair::from_private_bytes([seed; 32]);
-    Ok((PubsubMux::new(Host::new(socket, keypair)), addr))
+    let auth = Arc::new(NullAuthenticator);
+    Ok((PubsubMux::new(Host::new(socket, keypair), auth), addr))
 }
 
 /// Drive a single Noise XX handshake to completion between two muxes
 /// over real UDP datagrams.
 fn handshake_pair(
-    initiator: PubsubMux,
-    responder: PubsubMux,
+    initiator: NullMux,
+    responder: NullMux,
     initiator_addr: UdpAddr,
     responder_addr: UdpAddr,
     initiator_seed: [u8; 32],
     responder_seed: [u8; 32],
-) -> Result<(PubsubMux, PubsubMux), Error> {
+) -> Result<(NullMux, NullMux), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
     let (responder, ev) = responder
         .recv_one(responder_seed, unused_relay_rng())
@@ -99,13 +103,13 @@ fn handshake_pair(
 /// Pull `n` events off `mux` and find the [`MuxEvent::PubsubDelivered`]
 /// that matches `topic`.  Returns the reconstructed payload bytes.
 fn drain_until_delivery(
-    mux: PubsubMux,
+    mux: NullMux,
     n: usize,
     topic: &Topic,
-) -> Result<(PubsubMux, Vec<u8>), Error> {
+) -> Result<(NullMux, Vec<u8>), Error> {
     let (mux, events) = (0..n).try_fold(
         (mux, Vec::<MuxEvent>::new()),
-        |(mux, events), _| -> Result<(PubsubMux, Vec<MuxEvent>), Error> {
+        |(mux, events), _| -> Result<(NullMux, Vec<MuxEvent>), Error> {
             let (mux, ev) = mux.recv_one([0; 32], unused_relay_rng()).run()?;
             let next: Vec<MuxEvent> = events.into_iter().chain(core::iter::once(ev)).collect();
             Ok((mux, next))
@@ -164,8 +168,8 @@ fn three_node_rlnc_broadcast_decodes_at_both_receivers() -> Result<(), Error> {
         reason: e.to_string(),
     })?;
     let piece_byte_len = data.piece_byte_len();
-    let bob = bob.register_topic(topic.clone(), piece_count, piece_byte_len);
-    let carol = carol.register_topic(topic.clone(), piece_count, piece_byte_len);
+    let bob = bob.register_topic(topic.clone(), piece_count, piece_byte_len, ());
+    let carol = carol.register_topic(topic.clone(), piece_count, piece_byte_len, ());
 
     // 4. Alice broadcasts piece_count frames, fanned out to both peers.
     let _alice_after = alice

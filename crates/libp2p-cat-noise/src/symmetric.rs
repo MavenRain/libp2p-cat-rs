@@ -223,8 +223,21 @@ mod tests {
         let ciphertext = aead_encrypt(&key, 1, aad, b"hello")?;
         match aead_decrypt(&key, 2, aad, &ciphertext) {
             Err(Error::NoiseDecrypt) => Ok(()),
-            other => Err(Error::NoiseProtocol {
+            Err(
+                other @ (Error::Io(_)
+                | Error::InvalidProtocolId { .. }
+                | Error::InvalidPeerId { .. }
+                | Error::DatagramTooLarge { .. }
+                | Error::NoiseProtocol { .. }
+                | Error::NoiseReplay { .. }
+                | Error::RlncLayer { .. }
+                | Error::PubsubProtocol { .. }
+                | Error::HostState { .. }),
+            ) => Err(Error::NoiseProtocol {
                 reason: format!("expected NoiseDecrypt, got {other:?}"),
+            }),
+            Ok(bytes) => Err(Error::NoiseProtocol {
+                reason: format!("expected NoiseDecrypt, got Ok({bytes:?})"),
             }),
         }
     }

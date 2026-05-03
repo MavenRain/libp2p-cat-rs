@@ -1,6 +1,7 @@
 //! [`PubsubMux`]: a thin layer over [`Host`] that multiplexes raw
 //! application data and RLNC-coded pubsub frames onto a single
-//! authenticated UDP socket.
+//! authenticated UDP socket, with pluggable per-frame
+//! authentication via [`PubsubAuth`].
 //!
 //! # Wire envelope
 //!
@@ -11,24 +12,36 @@
 //!   application data delivered as
 //!   [`MuxEvent::AppData`].
 //! - [`KIND_PUBSUB`] (`0x01`): the rest of the plaintext is a
-//!   [`crate::PubsubFrame`].  The mux dispatches it to either the
-//!   matching topic decoder ([`MuxEvent::PubsubAbsorbed`] /
+//!   [`crate::PubsubFrame`] (commitment- and tag-tagged via the
+//!   [`WireAuthenticator`] in use).  The mux dispatches it to either
+//!   the matching topic decoder ([`MuxEvent::PubsubAbsorbed`] /
 //!   [`MuxEvent::PubsubDelivered`]) or the matching recoder
-//!   ([`MuxEvent::PubsubRelayed`]).
+//!   ([`MuxEvent::PubsubRelayed`]) **after** verifying the inbound
+//!   piece's commitment + tag.
 //!
 //! # Topic roles
 //!
 //! For a given topic a node plays exactly one of three roles:
 //!
 //! - **source**: build pieces locally with [`PubsubMux::broadcast`].
-//! - **decoder**: register with [`PubsubMux::register_topic`]; absorb
-//!   inbound pieces; surface a [`MuxEvent::PubsubDelivered`] when a
-//!   generation is reconstructed.
-//! - **relay**: register with [`PubsubMux::register_relay`]; on every
-//!   inbound piece, add it to a local buffer, generate a fresh
-//!   recoded piece by random linear combination of the buffered
-//!   pieces, and forward the recoded piece to every peer **except**
-//!   the source.  Surfaces a [`MuxEvent::PubsubRelayed`].
+//!   The mux's authenticator commits to the generation and tags
+//!   each emitted piece.
+//! - **decoder**: register with [`PubsubMux::register_topic`],
+//!   supplying the commitment received out-of-band; absorb inbound
+//!   pieces whose tag verifies against that commitment; surface a
+//!   [`MuxEvent::PubsubDelivered`] when the generation is
+//!   reconstructed.
+//! - **relay**: register with [`PubsubMux::register_relay`],
+//!   supplying the commitment; verify each inbound piece, add it to
+//!   the local recoder, generate a fresh recoded piece by random
+//!   linear combination of the buffered pieces, **re-tag** with the
+//!   local authenticator, and forward to every peer except the
+//!   source.  Surfaces a [`MuxEvent::PubsubRelayed`].
+//!
+//! Note: stock [`rlnc_cat_rs::auth::KeyedHashAuthenticator`] is *not
+//! homomorphic*, so a relay can only re-tag if it holds the same
+//! shared key as the source.  This matches the permissioned-network
+//! deployment model documented on that authenticator.
 //!
 //! Registering both decoder and recoder for the same topic on the
 //! same node is currently undefined; the second registration
@@ -43,12 +56,12 @@ use libp2p_cat_host::{Host, HostEvent};
 use libp2p_cat_noise::StaticPublicKey;
 use libp2p_cat_types::{Error, UdpAddr};
 
-use rlnc_cat_rs::auth::NullAuthenticator;
 use rlnc_cat_rs::coding::decode::DecoderState;
 use rlnc_cat_rs::coding::piece::{CodedPiece, OriginalData};
 use rlnc_cat_rs::coding::recode::Recoder;
 use rlnc_cat_rs::gossip::{WirePiece, source};
 
+use crate::auth::PubsubAuth;
 use crate::codec;
 use crate::topic::Topic;
 
@@ -120,8 +133,9 @@ pub enum MuxEvent {
     },
 
     /// An inbound datagram was rejected.  Also emitted when a kind
-    /// byte is unknown, a pubsub frame fails to parse, or a frame is
-    /// addressed to a topic with no registered role.
+    /// byte is unknown, a pubsub frame fails to parse, the
+    /// authenticator rejects a piece's tag, or a frame is addressed
+    /// to a topic with no registered role.
     Rejected {
         /// Source peer address.
         addr: UdpAddr,
@@ -130,23 +144,40 @@ pub enum MuxEvent {
     },
 }
 
-/// A [`Host`] paired with per-topic decoder and recoder state and a
-/// kind-byte-tagged plaintext envelope.
+/// A [`Host`] paired with per-topic decoder and recoder state, an
+/// authenticator, and a kind-byte-tagged plaintext envelope.
+///
+/// Generic over [`PubsubAuth`]; choose
+/// [`rlnc_cat_rs::auth::NullAuthenticator`] when no per-frame
+/// authentication is needed (zero wire overhead) or
+/// [`rlnc_cat_rs::auth::KeyedHashAuthenticator`] for keyed-BLAKE3
+/// MAC tagging.
 ///
 /// Every effectful method consumes `self` and returns a new mux.
 #[must_use]
-pub struct PubsubMux {
+pub struct PubsubMux<A: PubsubAuth>
+where
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+{
     host: Host,
-    decoders: BTreeMap<Topic, DecoderState>,
-    recoders: BTreeMap<Topic, Recoder>,
+    auth: Arc<A>,
+    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
+    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
 }
 
-impl PubsubMux {
-    /// Build a fresh mux around an existing host.  The host's
-    /// connection state is preserved as-is.
-    pub fn new(host: Host) -> Self {
+impl<A> PubsubMux<A>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+{
+    /// Build a fresh mux around an existing host with the given
+    /// authenticator.  The host's connection state is preserved.
+    pub fn new(host: Host, auth: Arc<A>) -> Self {
         Self {
             host,
+            auth,
             decoders: BTreeMap::new(),
             recoders: BTreeMap::new(),
         }
@@ -160,6 +191,14 @@ impl PubsubMux {
     /// Consume the mux and return its host, dropping pubsub state.
     pub fn into_host(self) -> Host {
         self.host
+    }
+
+    /// Compute the commitment for a fresh generation.  Useful for
+    /// nodes that want to publish the commitment out-of-band before
+    /// broadcasting.
+    #[must_use]
+    pub fn commit(&self, original: &OriginalData) -> A::Commitment {
+        self.auth.commit(original)
     }
 
     /// Local UDP address.
@@ -187,44 +226,71 @@ impl PubsubMux {
     pub fn dial(self, addr: UdpAddr, ephemeral_seed: [u8; 32]) -> Io<Error, Self> {
         let Self {
             host,
+            auth,
             decoders,
             recoders,
         } = self;
         host.dial(addr, ephemeral_seed).map(move |host| Self {
             host,
+            auth,
             decoders,
             recoders,
         })
     }
 
     /// Pre-register a topic for the **decoder** role: inbound pubsub
-    /// frames will be absorbed into a freshly-initialised decoder.
-    pub fn register_topic(self, topic: Topic, piece_count: usize, piece_byte_len: usize) -> Self {
+    /// frames for the topic will be verified against `commitment`
+    /// and absorbed into a freshly-initialised decoder.
+    pub fn register_topic(
+        self,
+        topic: Topic,
+        piece_count: usize,
+        piece_byte_len: usize,
+        commitment: A::Commitment,
+    ) -> Self {
         let Self {
             host,
+            auth,
             mut decoders,
             recoders,
         } = self;
-        decoders.insert(topic, DecoderState::new(piece_count, piece_byte_len));
+        decoders.insert(
+            topic,
+            (DecoderState::new(piece_count, piece_byte_len), commitment),
+        );
         Self {
             host,
+            auth,
             decoders,
             recoders,
         }
     }
 
     /// Pre-register a topic for the **relay** role: inbound pubsub
-    /// frames will be added to a local recoder and fanned out as
-    /// freshly-recoded pieces to all peers except the source.
-    pub fn register_relay(self, topic: Topic, piece_count: usize, piece_byte_len: usize) -> Self {
+    /// frames for the topic will be verified against `commitment`,
+    /// added to a local recoder, recoded by random linear
+    /// combination, re-tagged with the local authenticator, and
+    /// fanned out to all peers except the source.
+    pub fn register_relay(
+        self,
+        topic: Topic,
+        piece_count: usize,
+        piece_byte_len: usize,
+        commitment: A::Commitment,
+    ) -> Self {
         let Self {
             host,
+            auth,
             decoders,
             mut recoders,
         } = self;
-        recoders.insert(topic, Recoder::new(piece_count, piece_byte_len));
+        recoders.insert(
+            topic,
+            (Recoder::new(piece_count, piece_byte_len), commitment),
+        );
         Self {
             host,
+            auth,
             decoders,
             recoders,
         }
@@ -241,19 +307,22 @@ impl PubsubMux {
     pub fn send_app(self, addr: UdpAddr, payload: &[u8]) -> Io<Error, Self> {
         let Self {
             host,
+            auth,
             decoders,
             recoders,
         } = self;
         let framed = prefix_kind(KIND_APP, payload);
         host.send(addr, framed).map(move |host| Self {
             host,
+            auth,
             decoders,
             recoders,
         })
     }
 
     /// Broadcast `data` on `topic` to every established peer as
-    /// `num_pieces` RLNC-coded frames.  Each frame is prefixed with
+    /// `num_pieces` RLNC-coded frames.  Each frame is committed and
+    /// tagged with the mux's authenticator and prefixed with
     /// [`KIND_PUBSUB`] before encryption.
     ///
     /// # Errors
@@ -275,8 +344,8 @@ impl PubsubMux {
     {
         let piece_count = data.piece_count();
         let piece_byte_len = data.piece_byte_len();
-        let auth = Arc::new(NullAuthenticator);
-        let (_commitment, stream) = source(auth, data, rng_factory);
+        let auth_for_source = Arc::clone(&self.auth);
+        let (_commitment, stream) = source(auth_for_source, data, rng_factory);
         stream
             .take(num_pieces)
             .collect()
@@ -286,7 +355,7 @@ impl PubsubMux {
             .flat_map(move |pieces| {
                 let frames = pieces
                     .iter()
-                    .map(|wp| codec::encode(&topic, piece_count, piece_byte_len, wp))
+                    .map(|wp| codec::encode::<A>(&topic, piece_count, piece_byte_len, wp))
                     .collect::<Result<Vec<Vec<u8>>, Error>>();
                 Io::suspend(move || frames).flat_map(move |frames| fan_out_all(self, frames))
             })
@@ -309,7 +378,8 @@ impl PubsubMux {
     /// # Errors
     ///
     /// Propagates [`Host::recv_one`] errors.  Per-peer / per-frame
-    /// problems surface as [`MuxEvent::Rejected`] rather than `Err`.
+    /// problems (including auth tag rejection) surface as
+    /// [`MuxEvent::Rejected`] rather than `Err`.
     #[must_use]
     pub fn recv_one<R>(self, ephemeral_seed: [u8; 32], relay_rng: R) -> Io<Error, (Self, MuxEvent)>
     where
@@ -317,12 +387,13 @@ impl PubsubMux {
     {
         let Self {
             host,
+            auth,
             decoders,
             recoders,
         } = self;
         host.recv_one(ephemeral_seed)
             .flat_map(move |(host, host_event)| {
-                process_event(host, decoders, recoders, host_event, relay_rng)
+                process_event(host, auth, decoders, recoders, host_event, relay_rng)
             })
     }
 }
@@ -347,24 +418,36 @@ pub fn unused_relay_rng()
 }
 
 /// Fan a list of pubsub frames out to every established peer.
-fn fan_out_all(mux: PubsubMux, frames: Vec<Vec<u8>>) -> Io<Error, PubsubMux> {
+fn fan_out_all<A>(mux: PubsubMux<A>, frames: Vec<Vec<u8>>) -> Io<Error, PubsubMux<A>>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+{
     frames.into_iter().fold(Io::pure(mux), |acc, frame| {
         acc.flat_map(move |mux| send_frame_to_all(mux, &frame))
     })
 }
 
-fn send_frame_to_all(mux: PubsubMux, frame: &[u8]) -> Io<Error, PubsubMux> {
+fn send_frame_to_all<A>(mux: PubsubMux<A>, frame: &[u8]) -> Io<Error, PubsubMux<A>>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+{
     let addrs = mux.host.established_addrs();
     addrs.into_iter().fold(Io::pure(mux), |acc, addr| {
         let datagram = prefix_kind(KIND_PUBSUB, frame);
         acc.flat_map(move |mux| {
             let PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             } = mux;
             host.send(addr, datagram).map(move |host| PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             })
@@ -374,11 +457,16 @@ fn send_frame_to_all(mux: PubsubMux, frame: &[u8]) -> Io<Error, PubsubMux> {
 
 /// Fan a single pubsub frame out to every established peer except
 /// `exclude`.  Returns the number of peers actually sent to.
-fn send_frame_excluding(
-    mux: PubsubMux,
+fn send_frame_excluding<A>(
+    mux: PubsubMux<A>,
     frame: &[u8],
     exclude: UdpAddr,
-) -> Io<Error, (PubsubMux, usize)> {
+) -> Io<Error, (PubsubMux<A>, usize)>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+{
     let addrs: Vec<UdpAddr> = mux
         .host
         .established_addrs()
@@ -391,11 +479,13 @@ fn send_frame_excluding(
         acc.flat_map(move |mux| {
             let PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             } = mux;
             host.send(addr, datagram).map(move |host| PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             })
@@ -404,23 +494,26 @@ fn send_frame_excluding(
     mux_io.map(move |mux| (mux, count))
 }
 
-/// Process one [`HostEvent`] through the mux's bookkeeping.  Returns
-/// an `Io` because the relay path may need to send recoded frames to
-/// multiple peers.
-fn process_event<R>(
+/// Process one [`HostEvent`] through the mux's bookkeeping.
+fn process_event<A, R>(
     host: Host,
-    decoders: BTreeMap<Topic, DecoderState>,
-    recoders: BTreeMap<Topic, Recoder>,
+    auth: Arc<A>,
+    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
+    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
     ev: HostEvent,
     relay_rng: R,
-) -> Io<Error, (PubsubMux, MuxEvent)>
+) -> Io<Error, (PubsubMux<A>, MuxEvent)>
 where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
     R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
 {
     match ev {
         HostEvent::HandshakeProgress { addr } => Io::pure((
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
@@ -432,6 +525,7 @@ where
         } => Io::pure((
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
@@ -443,28 +537,31 @@ where
         HostEvent::Rejected { addr, reason } => Io::pure((
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
             MuxEvent::Rejected { addr, reason },
         )),
         HostEvent::DatagramDelivered { addr, plaintext } => {
-            dispatch_plaintext(host, decoders, recoders, addr, &plaintext, relay_rng)
+            dispatch_plaintext(host, auth, decoders, recoders, addr, &plaintext, relay_rng)
         }
     }
 }
 
-/// Inspect the `[kind, payload...]` envelope and produce the right
-/// follow-up [`MuxEvent`].
-fn dispatch_plaintext<R>(
+fn dispatch_plaintext<A, R>(
     host: Host,
-    decoders: BTreeMap<Topic, DecoderState>,
-    recoders: BTreeMap<Topic, Recoder>,
+    auth: Arc<A>,
+    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
+    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
     addr: UdpAddr,
     plaintext: &[u8],
     relay_rng: R,
-) -> Io<Error, (PubsubMux, MuxEvent)>
+) -> Io<Error, (PubsubMux<A>, MuxEvent)>
 where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
     R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
 {
     let kind = plaintext.first().copied();
@@ -474,6 +571,7 @@ where
             Io::pure((
                 PubsubMux {
                     host,
+                    auth,
                     decoders,
                     recoders,
                 },
@@ -482,11 +580,12 @@ where
         }
         () if kind == Some(KIND_PUBSUB) => {
             let body = plaintext.get(1..).unwrap_or(&[]);
-            handle_pubsub_body(host, decoders, recoders, addr, body, relay_rng)
+            handle_pubsub_body(host, auth, decoders, recoders, addr, body, relay_rng)
         }
         () if kind.is_none() => Io::pure((
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
@@ -500,6 +599,7 @@ where
             Io::pure((
                 PubsubMux {
                     host,
+                    auth,
                     decoders,
                     recoders,
                 },
@@ -512,22 +612,27 @@ where
     }
 }
 
-fn handle_pubsub_body<R>(
+fn handle_pubsub_body<A, R>(
     host: Host,
-    decoders: BTreeMap<Topic, DecoderState>,
-    recoders: BTreeMap<Topic, Recoder>,
+    auth: Arc<A>,
+    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
+    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
     addr: UdpAddr,
     body: &[u8],
     relay_rng: R,
-) -> Io<Error, (PubsubMux, MuxEvent)>
+) -> Io<Error, (PubsubMux<A>, MuxEvent)>
 where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
     R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
 {
-    let parsed = codec::decode(body);
+    let parsed = codec::decode::<A>(body);
     match parsed {
         Err(e) => Io::pure((
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
@@ -543,6 +648,7 @@ where
             if recoders.contains_key(&topic) {
                 relay_path(
                     host,
+                    auth,
                     decoders,
                     recoders,
                     addr,
@@ -553,6 +659,7 @@ where
             } else if decoders.contains_key(&topic) {
                 Io::pure(decoder_path(
                     host,
+                    auth,
                     decoders,
                     recoders,
                     addr,
@@ -563,6 +670,7 @@ where
                 Io::pure((
                     PubsubMux {
                         host,
+                        auth,
                         decoders,
                         recoders,
                     },
@@ -576,18 +684,25 @@ where
     }
 }
 
-fn decoder_path(
+fn decoder_path<A>(
     host: Host,
-    mut decoders: BTreeMap<Topic, DecoderState>,
-    recoders: BTreeMap<Topic, Recoder>,
+    auth: Arc<A>,
+    mut decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
+    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
     addr: UdpAddr,
     topic: Topic,
-    wire_piece: &WirePiece<NullAuthenticator>,
-) -> (PubsubMux, MuxEvent) {
+    wire_piece: &WirePiece<A>,
+) -> (PubsubMux<A>, MuxEvent)
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+{
     match decoders.remove(&topic) {
         None => (
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
@@ -596,70 +711,100 @@ fn decoder_path(
                 reason: format!("decoder for topic {topic} vanished mid-dispatch"),
             },
         ),
-        Some(decoder) => match decoder.absorb(wire_piece.piece()) {
-            Err(e) => (
-                PubsubMux {
-                    host,
-                    decoders,
-                    recoders,
+        Some((decoder, commitment)) => {
+            let verify_outcome = auth.verify(&commitment, wire_piece.piece(), wire_piece.tag());
+            match verify_outcome {
+                Err(e) => {
+                    decoders.insert(topic.clone(), (decoder, commitment));
+                    (
+                        PubsubMux {
+                            host,
+                            auth,
+                            decoders,
+                            recoders,
+                        },
+                        MuxEvent::Rejected {
+                            addr,
+                            reason: format!("auth verify failed for topic {topic}: {e}"),
+                        },
+                    )
+                }
+                Ok(()) => match decoder.absorb(wire_piece.piece()) {
+                    Err(e) => (
+                        PubsubMux {
+                            host,
+                            auth,
+                            decoders,
+                            recoders,
+                        },
+                        MuxEvent::Rejected {
+                            addr,
+                            reason: format!("absorb failed: {e}"),
+                        },
+                    ),
+                    Ok(next) if next.is_complete() => match next.decode() {
+                        Ok(data) => (
+                            PubsubMux {
+                                host,
+                                auth,
+                                decoders,
+                                recoders,
+                            },
+                            MuxEvent::PubsubDelivered { addr, topic, data },
+                        ),
+                        Err(e) => (
+                            PubsubMux {
+                                host,
+                                auth,
+                                decoders,
+                                recoders,
+                            },
+                            MuxEvent::Rejected {
+                                addr,
+                                reason: format!("decode failed: {e}"),
+                            },
+                        ),
+                    },
+                    Ok(next) => {
+                        decoders.insert(topic.clone(), (next, commitment));
+                        (
+                            PubsubMux {
+                                host,
+                                auth,
+                                decoders,
+                                recoders,
+                            },
+                            MuxEvent::PubsubAbsorbed { addr, topic },
+                        )
+                    }
                 },
-                MuxEvent::Rejected {
-                    addr,
-                    reason: format!("absorb failed: {e}"),
-                },
-            ),
-            Ok(next) if next.is_complete() => match next.decode() {
-                Ok(data) => (
-                    PubsubMux {
-                        host,
-                        decoders,
-                        recoders,
-                    },
-                    MuxEvent::PubsubDelivered { addr, topic, data },
-                ),
-                Err(e) => (
-                    PubsubMux {
-                        host,
-                        decoders,
-                        recoders,
-                    },
-                    MuxEvent::Rejected {
-                        addr,
-                        reason: format!("decode failed: {e}"),
-                    },
-                ),
-            },
-            Ok(next) => {
-                decoders.insert(topic.clone(), next);
-                (
-                    PubsubMux {
-                        host,
-                        decoders,
-                        recoders,
-                    },
-                    MuxEvent::PubsubAbsorbed { addr, topic },
-                )
             }
-        },
+        }
     }
 }
 
-fn relay_path<R>(
+#[allow(clippy::too_many_arguments)]
+fn relay_path<A, R>(
     host: Host,
-    decoders: BTreeMap<Topic, DecoderState>,
-    mut recoders: BTreeMap<Topic, Recoder>,
+    auth: Arc<A>,
+    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
+    mut recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
     addr: UdpAddr,
     topic: Topic,
-    wire_piece: &WirePiece<NullAuthenticator>,
+    wire_piece: &WirePiece<A>,
     relay_rng: R,
-) -> Io<Error, (PubsubMux, MuxEvent)>
+) -> Io<Error, (PubsubMux<A>, MuxEvent)>
 where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
     R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
 {
     match recoders.remove(&topic) {
         None => Io::pure((
             PubsubMux {
                 host,
+                auth,
                 decoders,
                 recoders,
             },
@@ -668,52 +813,80 @@ where
                 reason: format!("recoder for topic {topic} vanished mid-dispatch"),
             },
         )),
-        Some(recoder) => match recoder.add_piece(wire_piece.piece()) {
-            Err(e) => Io::pure((
-                PubsubMux {
-                    host,
-                    decoders,
-                    recoders,
-                },
-                MuxEvent::Rejected {
-                    addr,
-                    reason: format!("recoder add_piece failed: {e}"),
-                },
-            )),
-            Ok(next_recoder) => {
-                let piece_count = wire_piece.piece().coding_vector().len();
-                let piece_byte_len = wire_piece.piece().data().len();
-                let recode_io = next_recoder.recode_one(relay_rng);
-                recoders.insert(topic.clone(), next_recoder);
-                recode_io
-                    .map_error(|e| Error::RlncLayer {
-                        reason: e.to_string(),
-                    })
-                    .flat_map(move |recoded: CodedPiece| {
-                        let recoded_wire = WirePiece::<NullAuthenticator>::new((), recoded, ());
-                        let frame_result =
-                            codec::encode(&topic, piece_count, piece_byte_len, &recoded_wire);
-                        Io::suspend(move || frame_result).flat_map(move |frame| {
-                            let mux = PubsubMux {
-                                host,
-                                decoders,
-                                recoders,
-                            };
-                            send_frame_excluding(mux, &frame, addr).map(
-                                move |(mux, fanout_count)| {
-                                    (
-                                        mux,
-                                        MuxEvent::PubsubRelayed {
-                                            from: addr,
-                                            topic,
-                                            fanout_count,
+        Some((recoder, commitment)) => {
+            let verify_outcome = auth.verify(&commitment, wire_piece.piece(), wire_piece.tag());
+            match verify_outcome {
+                Err(e) => {
+                    recoders.insert(topic.clone(), (recoder, commitment));
+                    Io::pure((
+                        PubsubMux {
+                            host,
+                            auth,
+                            decoders,
+                            recoders,
+                        },
+                        MuxEvent::Rejected {
+                            addr,
+                            reason: format!("auth verify failed for topic {topic}: {e}"),
+                        },
+                    ))
+                }
+                Ok(()) => match recoder.add_piece(wire_piece.piece()) {
+                    Err(e) => Io::pure((
+                        PubsubMux {
+                            host,
+                            auth,
+                            decoders,
+                            recoders,
+                        },
+                        MuxEvent::Rejected {
+                            addr,
+                            reason: format!("recoder add_piece failed: {e}"),
+                        },
+                    )),
+                    Ok(next_recoder) => {
+                        let piece_count = wire_piece.piece().coding_vector().len();
+                        let piece_byte_len = wire_piece.piece().data().len();
+                        let recode_io = next_recoder.recode_one(relay_rng);
+                        recoders.insert(topic.clone(), (next_recoder, commitment.clone()));
+                        let auth_for_tag = Arc::clone(&auth);
+                        recode_io
+                            .map_error(|e| Error::RlncLayer {
+                                reason: e.to_string(),
+                            })
+                            .flat_map(move |recoded: CodedPiece| {
+                                let tag = auth_for_tag.tag(&commitment, &recoded);
+                                let recoded_wire = WirePiece::<A>::new(commitment, recoded, tag);
+                                let frame_result = codec::encode::<A>(
+                                    &topic,
+                                    piece_count,
+                                    piece_byte_len,
+                                    &recoded_wire,
+                                );
+                                Io::suspend(move || frame_result).flat_map(move |frame| {
+                                    let mux = PubsubMux {
+                                        host,
+                                        auth,
+                                        decoders,
+                                        recoders,
+                                    };
+                                    send_frame_excluding(mux, &frame, addr).map(
+                                        move |(mux, fanout_count)| {
+                                            (
+                                                mux,
+                                                MuxEvent::PubsubRelayed {
+                                                    from: addr,
+                                                    topic,
+                                                    fanout_count,
+                                                },
+                                            )
                                         },
                                     )
-                                },
-                            )
-                        })
-                    })
+                                })
+                            })
+                    }
+                },
             }
-        },
+        }
     }
 }

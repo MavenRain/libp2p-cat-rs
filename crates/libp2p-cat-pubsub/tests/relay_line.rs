@@ -34,7 +34,10 @@ use libp2p_cat_noise::StaticKeypair;
 use libp2p_cat_pubsub::{MuxEvent, PubsubMux, Topic, unused_relay_rng};
 use libp2p_cat_types::{Error, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
+use rlnc_cat_rs::auth::NullAuthenticator;
 use rlnc_cat_rs::coding::piece::OriginalData;
+
+type NullMux = PubsubMux<NullAuthenticator>;
 
 fn loopback_v4() -> UdpAddr {
     UdpAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -48,11 +51,12 @@ fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
     }
 }
 
-fn build_mux(seed: u8) -> Result<(PubsubMux, UdpAddr), Error> {
+fn build_mux(seed: u8) -> Result<(NullMux, UdpAddr), Error> {
     let socket = UdpTransport::bind(loopback_v4()).run()?;
     let addr = socket.local_addr()?;
     let keypair = StaticKeypair::from_private_bytes([seed; 32]);
-    Ok((PubsubMux::new(Host::new(socket, keypair)), addr))
+    let auth = Arc::new(NullAuthenticator);
+    Ok((PubsubMux::new(Host::new(socket, keypair), auth), addr))
 }
 
 fn expect_handshake_progress(ev: MuxEvent, expected_addr: UdpAddr) -> Result<(), Error> {
@@ -76,13 +80,13 @@ fn expect_handshake_complete(ev: MuxEvent, expected_addr: UdpAddr) -> Result<(),
 /// Drive a Noise XX handshake to completion between two muxes over
 /// real UDP datagrams.
 fn handshake_pair(
-    initiator: PubsubMux,
-    responder: PubsubMux,
+    initiator: NullMux,
+    responder: NullMux,
     initiator_addr: UdpAddr,
     responder_addr: UdpAddr,
     initiator_seed: [u8; 32],
     responder_seed: [u8; 32],
-) -> Result<(PubsubMux, PubsubMux), Error> {
+) -> Result<(NullMux, NullMux), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
     let (responder, ev) = responder
         .recv_one(responder_seed, unused_relay_rng())
@@ -148,8 +152,8 @@ fn relay_line_decodes_at_downstream() -> Result<(), Error> {
         reason: e.to_string(),
     })?;
     let piece_byte_len = data.piece_byte_len();
-    let relay = relay.register_relay(topic.clone(), piece_count, piece_byte_len);
-    let bob = bob.register_topic(topic.clone(), piece_count, piece_byte_len);
+    let relay = relay.register_relay(topic.clone(), piece_count, piece_byte_len, ());
+    let bob = bob.register_topic(topic.clone(), piece_count, piece_byte_len, ());
 
     // 4. Alice broadcasts piece_count frames; her only peer is the
     // relay, so all three datagrams land at the relay's inbox.
@@ -162,31 +166,28 @@ fn relay_line_decodes_at_downstream() -> Result<(), Error> {
     // forwards the recoded piece to every peer except the source —
     // i.e. just bob.  Each call yields a `PubsubRelayed` event with
     // `fanout_count == 1`.
-    let relay_after = (0..piece_count).try_fold(
-        relay,
-        |relay, idx| -> Result<PubsubMux, Error> {
-            let (relay, ev) = relay.recv_one([0; 32], ones_rng_once()).run()?;
-            match ev {
-                MuxEvent::PubsubRelayed {
-                    from,
-                    topic: t,
-                    fanout_count,
-                } if from == alice_addr && t == topic && fanout_count == 1 => Ok(relay),
-                other => Err(Error::PubsubProtocol {
-                    reason: format!(
-                        "relay piece {idx}: expected PubsubRelayed(from=alice, fanout=1), got {other:?}"
-                    ),
-                }),
-            }
-        },
-    )?;
+    let relay_after = (0..piece_count).try_fold(relay, |relay, idx| -> Result<NullMux, Error> {
+        let (relay, ev) = relay.recv_one([0; 32], ones_rng_once()).run()?;
+        match ev {
+            MuxEvent::PubsubRelayed {
+                from,
+                topic: t,
+                fanout_count,
+            } if from == alice_addr && t == topic && fanout_count == 1 => Ok(relay),
+            other => Err(Error::PubsubProtocol {
+                reason: format!(
+                    "relay piece {idx}: expected PubsubRelayed(from=alice, fanout=1), got {other:?}"
+                ),
+            }),
+        }
+    })?;
     drop(relay_after);
 
     // 6. Bob drains piece_count datagrams.  The third absorbed piece
     // completes the decoder.
     let (_bob_after, bob_data) = (0..piece_count).try_fold(
         (bob, None::<Vec<u8>>),
-        |(bob, acc), idx| -> Result<(PubsubMux, Option<Vec<u8>>), Error> {
+        |(bob, acc), idx| -> Result<(NullMux, Option<Vec<u8>>), Error> {
             let (bob, ev) = bob.recv_one([0; 32], unused_relay_rng()).run()?;
             match ev {
                 MuxEvent::PubsubAbsorbed { addr, topic: t } if addr == relay_addr && t == topic => {

@@ -5,7 +5,7 @@
 //! authenticated UDP transport managed by `libp2p-cat-host`.  The
 //! result is a multiplexer that can carry both raw application
 //! datagrams and RLNC-coded pubsub frames over a single Noise
-//! session per peer.
+//! session per peer, with pluggable per-frame authentication.
 //!
 //! # Wire format
 //!
@@ -14,13 +14,16 @@
 //! ([`KIND_APP`] / [`KIND_PUBSUB`]).  Pubsub frames use the layout
 //!
 //! ```text
-//! +-------------+--------------+-------------+-------------+--------------+
-//! | topic_len:1 | topic_bytes  | k: u32 BE   | b: u32 BE   | piece bytes  |
-//! |             | (≤ MAX_TOPIC)| (4 bytes)   | (4 bytes)   | (k + b)      |
-//! +-------------+--------------+-------------+-------------+--------------+
+//! +-------------+--------------+-------------+-------------+--------------+--------+--------------+
+//! | topic_len:1 | topic_bytes  | k: u32 BE   | b: u32 BE   | commitment   | tag    | piece bytes  |
+//! |             | (≤ MAX_TOPIC)| (4 bytes)   | (4 bytes)   | (auth-sized) | (sized)| (k + b)      |
+//! +-------------+--------------+-------------+-------------+--------------+--------+--------------+
 //! ```
 //!
-//! after the kind byte.  Piece bytes are produced by
+//! after the kind byte.  The `commitment` and `tag` widths come from
+//! the [`WireAuthenticator`] in use; for [`rlnc_cat_rs::auth::NullAuthenticator`]
+//! both are zero bytes, so the format collapses to its earlier shape.
+//! Piece bytes are produced by
 //! [`rlnc_cat_rs::coding::piece::CodedPiece::to_bytes`] and parsed
 //! back via `CodedPiece::from_bytes(_, piece_count)`; the `(k, b)`
 //! integers in the header carry the dimensions a receiver needs to
@@ -28,24 +31,30 @@
 //!
 //! # Scope
 //!
-//! v1 is intentionally small:
-//!
-//! - **Source + receive only**: every node can broadcast and decode,
-//!   but no node performs RLNC recoding for relay.  Recode/relay
-//!   roles are a follow-up.
-//! - **`NullAuthenticator` only**: the rlnc commitment / tag fields
-//!   are zero bytes on the wire.  Switching to keyed-hash or LHS
-//!   authentication is a codec change plus generic plumbing.
+//! - **Source + decoder + relay roles** per topic per node, registered via
+//!   [`PubsubMux::broadcast`], [`PubsubMux::register_topic`], and
+//!   [`PubsubMux::register_relay`] respectively.
+//! - **Pluggable authenticators** via the [`WireAuthenticator`] /
+//!   [`PubsubAuth`] traits.  Stock impls cover
+//!   [`rlnc_cat_rs::auth::NullAuthenticator`] (no auth, zero wire
+//!   overhead) and [`rlnc_cat_rs::auth::KeyedHashAuthenticator`]
+//!   (32-byte commitment + 32-byte BLAKE3-keyed-hash tag).  The
+//!   keyed-hash construction is **not homomorphic**: a relay needs
+//!   the shared key to verify inbound pieces and re-tag the recoded
+//!   outbound pieces.  Suitable for permissioned networks; future
+//!   homomorphic-signature impls will lift that constraint.
 //! - **One generation per topic**: when a topic decodes successfully
 //!   the corresponding decoder is consumed; callers re-register the
 //!   topic to receive another generation.
 
 #![forbid(unsafe_code)]
 
+mod auth;
 mod codec;
 mod mux;
 mod topic;
 
+pub use auth::{PubsubAuth, WireAuthenticator};
 pub use codec::{MAX_TOPIC_LEN, PubsubFrame, decode, encode};
 pub use mux::{KIND_APP, KIND_PUBSUB, MuxEvent, PubsubMux, unused_relay_rng};
 pub use topic::Topic;

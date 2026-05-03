@@ -5,32 +5,37 @@
 //! Noise-authenticated datagram.  The layout, all big-endian integers:
 //!
 //! ```text
-//! +-------------+--------------+-------------+-------------+--------------+
-//! | topic_len:1 | topic_bytes  | k: u32      | b: u32      | piece bytes  |
-//! |             | (≤ MAX_TOPIC)| (4 bytes)   | (4 bytes)   | (k + b)      |
-//! +-------------+--------------+-------------+-------------+--------------+
+//! +-------------+--------------+-------------+-------------+--------------+--------+--------------+
+//! | topic_len:1 | topic_bytes  | k: u32      | b: u32      | commitment   | tag    | piece bytes  |
+//! |             | (≤ MAX_TOPIC)| (4 bytes)   | (4 bytes)   | (auth-sized) | (sized)| (k + b)      |
+//! +-------------+--------------+-------------+-------------+--------------+--------+--------------+
 //! ```
 //!
-//! Piece bytes are produced by [`CodedPiece::to_bytes`] and parsed by
-//! `CodedPiece::from_bytes(_, piece_count)`; the `(k, b)` integers in
-//! the header carry the dimensions a receiver needs to instantiate its
-//! decoder before a single piece arrives.
+//! `commitment` and `tag` widths are fixed by the
+//! [`WireAuthenticator`] in use:
+//! [`rlnc_cat_rs::auth::NullAuthenticator`] uses zero bytes for
+//! both, while
+//! [`rlnc_cat_rs::auth::KeyedHashAuthenticator`] uses 32 bytes each.
+//!
+//! Piece bytes are produced by [`CodedPiece::to_bytes`] and parsed
+//! by `CodedPiece::from_bytes(_, piece_count)`; the `(k, b)`
+//! integers in the header carry the dimensions a receiver needs to
+//! instantiate its decoder before a single piece arrives.
 
 use libp2p_cat_types::Error;
 
-use rlnc_cat_rs::auth::NullAuthenticator;
+use rlnc_cat_rs::auth::Authenticator;
 use rlnc_cat_rs::coding::piece::CodedPiece;
 use rlnc_cat_rs::gossip::WirePiece;
 
+use crate::auth::WireAuthenticator;
 use crate::topic::Topic;
 
 /// Maximum number of bytes a topic name may occupy on the wire.
 pub const MAX_TOPIC_LEN: usize = 255;
 
-/// Number of bytes in the fixed prefix preceding the variable-length
-/// piece bytes: 1 byte topic length + (≤255) topic bytes + 4 bytes `k`
-/// + 4 bytes `b`.
-const FIXED_TAIL: usize = 8; // k(4) + b(4)
+/// Number of bytes in the fixed-width `(k, b)` block.
+const KB_LEN: usize = 8;
 
 /// A parsed pubsub frame.
 ///
@@ -50,18 +55,23 @@ pub struct PubsubFrame {
     pub piece_bytes: Vec<u8>,
 }
 
-/// Encode a frame to bytes.
+/// Encode a frame to bytes for the chosen authenticator type `A`.
 ///
 /// # Errors
 ///
 /// - [`Error::PubsubProtocol`] if `k` or `b` does not fit in `u32`,
 ///   or if the frame would exceed `usize::MAX` bytes.
-pub fn encode(
+pub fn encode<A>(
     topic: &Topic,
     piece_count: usize,
     piece_byte_len: usize,
-    wire_piece: &WirePiece<NullAuthenticator>,
-) -> Result<Vec<u8>, Error> {
+    wire_piece: &WirePiece<A>,
+) -> Result<Vec<u8>, Error>
+where
+    A: Authenticator + WireAuthenticator,
+    A::Commitment: Clone,
+    A::Tag: Clone,
+{
     let topic_bytes = topic.as_bytes();
     let topic_len_byte = u8::try_from(topic_bytes.len()).map_err(|_| Error::PubsubProtocol {
         reason: format!("topic length {} exceeds u8 range", topic_bytes.len()),
@@ -72,27 +82,36 @@ pub fn encode(
     let b = u32::try_from(piece_byte_len).map_err(|_| Error::PubsubProtocol {
         reason: format!("piece_byte_len {piece_byte_len} exceeds u32 range"),
     })?;
+    let commitment_bytes = A::commitment_to_vec(wire_piece.commitment());
+    let tag_bytes = A::tag_to_vec(wire_piece.tag());
     let piece_bytes = wire_piece.piece().to_bytes();
-    let header_iter = [topic_len_byte]
+    let frame: Vec<u8> = [topic_len_byte]
         .into_iter()
         .chain(topic_bytes.iter().copied())
         .chain(k.to_be_bytes())
-        .chain(b.to_be_bytes());
-    let frame: Vec<u8> = header_iter.chain(piece_bytes).collect();
+        .chain(b.to_be_bytes())
+        .chain(commitment_bytes)
+        .chain(tag_bytes)
+        .chain(piece_bytes)
+        .collect();
     Ok(frame)
 }
 
-/// Decode a frame from bytes back into a [`PubsubFrame`] and the
-/// reconstructed [`WirePiece`].
+/// Decode a frame for the chosen authenticator type `A`.
 ///
 /// # Errors
 ///
 /// - [`Error::PubsubProtocol`] if the frame is shorter than the
-///   header demands, the topic length byte is zero, or the topic is
-///   not valid printable ASCII.
+///   header demands, the topic length byte is zero, the topic is not
+///   valid printable ASCII, or commitment / tag bytes are malformed.
 /// - [`Error::RlncLayer`] if the piece bytes do not match `k + b`
 ///   (parsed via [`CodedPiece::from_bytes`]).
-pub fn decode(bytes: &[u8]) -> Result<(PubsubFrame, WirePiece<NullAuthenticator>), Error> {
+pub fn decode<A>(bytes: &[u8]) -> Result<(PubsubFrame, WirePiece<A>), Error>
+where
+    A: Authenticator + WireAuthenticator,
+    A::Commitment: Clone,
+    A::Tag: Clone,
+{
     let topic_len_byte = bytes
         .first()
         .copied()
@@ -100,7 +119,7 @@ pub fn decode(bytes: &[u8]) -> Result<(PubsubFrame, WirePiece<NullAuthenticator>
             reason: "frame missing topic length byte".to_owned(),
         })?;
     let topic_len = usize::from(topic_len_byte);
-    let header_end = 1 + topic_len + FIXED_TAIL;
+    let header_end = 1 + topic_len + KB_LEN + A::COMMITMENT_LEN + A::TAG_LEN;
     if bytes.len() < header_end {
         Err(Error::PubsubProtocol {
             reason: format!(
@@ -133,6 +152,23 @@ pub fn decode(bytes: &[u8]) -> Result<(PubsubFrame, WirePiece<NullAuthenticator>
             })?;
         let piece_count = u32::from_be_bytes(parse_4(k_slice)?);
         let piece_byte_len = u32::from_be_bytes(parse_4(b_slice)?);
+        let auth_block_start = 1 + topic_len + KB_LEN;
+        let commitment_end = auth_block_start + A::COMMITMENT_LEN;
+        let tag_end = commitment_end + A::TAG_LEN;
+        let commitment_slice =
+            bytes
+                .get(auth_block_start..commitment_end)
+                .ok_or_else(|| Error::PubsubProtocol {
+                    reason: "frame missing commitment bytes".to_owned(),
+                })?;
+        let tag_slice =
+            bytes
+                .get(commitment_end..tag_end)
+                .ok_or_else(|| Error::PubsubProtocol {
+                    reason: "frame missing tag bytes".to_owned(),
+                })?;
+        let commitment = A::commitment_from_bytes(commitment_slice)?;
+        let tag = A::tag_from_bytes(tag_slice)?;
         let piece_bytes = bytes
             .get(header_end..)
             .ok_or_else(|| Error::PubsubProtocol {
@@ -144,7 +180,7 @@ pub fn decode(bytes: &[u8]) -> Result<(PubsubFrame, WirePiece<NullAuthenticator>
             CodedPiece::from_bytes(&piece_bytes, piece_count_us).map_err(|e| Error::RlncLayer {
                 reason: e.to_string(),
             })?;
-        let wire_piece = WirePiece::<NullAuthenticator>::new((), coded, ());
+        let wire_piece = WirePiece::<A>::new(commitment, coded, tag);
         Ok((
             PubsubFrame {
                 topic,
@@ -172,14 +208,26 @@ fn usize_from_u32(n: u32) -> Result<usize, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rlnc_cat_rs::auth::{
+        KeyedHashAuthenticator, KeyedHashCommitment, KeyedHashTag, NullAuthenticator,
+    };
     use rlnc_cat_rs::coding::piece::CodingVector;
     use rlnc_cat_rs::vector::GfVec;
 
-    fn sample_wire_piece() -> WirePiece<NullAuthenticator> {
+    fn sample_coded() -> CodedPiece {
         let cv = CodingVector::from_bytes(&[1, 0, 0]);
         let data = GfVec::from_bytes(&[7, 8, 9, 10]);
-        let piece = CodedPiece::new(cv, data);
-        WirePiece::new((), piece, ())
+        CodedPiece::new(cv, data)
+    }
+
+    fn sample_null_wire_piece() -> WirePiece<NullAuthenticator> {
+        WirePiece::new((), sample_coded(), ())
+    }
+
+    fn sample_keyed_wire_piece() -> WirePiece<KeyedHashAuthenticator> {
+        let commitment = KeyedHashCommitment::from([0xAAu8; 32]);
+        let tag = KeyedHashTag::from([0x55u8; 32]);
+        WirePiece::new(commitment, sample_coded(), tag)
     }
 
     fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
@@ -203,11 +251,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_round_trip() -> Result<(), Error> {
+    fn null_round_trip() -> Result<(), Error> {
         let topic: Topic = "/chat/v1".try_into()?;
-        let wp = sample_wire_piece();
-        let bytes = encode(&topic, 3, 4, &wp)?;
-        let (frame, decoded) = decode(&bytes)?;
+        let wp = sample_null_wire_piece();
+        let bytes = encode::<NullAuthenticator>(&topic, 3, 4, &wp)?;
+        let (frame, decoded) = decode::<NullAuthenticator>(&bytes)?;
         check(frame.topic == topic, || {
             format!("topic mismatch: {}", frame.topic)
         })?;
@@ -223,8 +271,43 @@ mod tests {
     }
 
     #[test]
+    fn keyed_hash_round_trip() -> Result<(), Error> {
+        let topic: Topic = "/chat/v1".try_into()?;
+        let wp = sample_keyed_wire_piece();
+        let bytes = encode::<KeyedHashAuthenticator>(&topic, 3, 4, &wp)?;
+        let (frame, decoded) = decode::<KeyedHashAuthenticator>(&bytes)?;
+        check(frame.topic == topic, || {
+            format!("topic mismatch: {}", frame.topic)
+        })?;
+        check(decoded.piece() == wp.piece(), || {
+            "piece round-trip mismatch".to_owned()
+        })?;
+        check(
+            decoded.commitment().as_bytes() == wp.commitment().as_bytes(),
+            || "commitment round-trip mismatch".to_owned(),
+        )?;
+        check(decoded.tag().as_bytes() == wp.tag().as_bytes(), || {
+            "tag round-trip mismatch".to_owned()
+        })
+    }
+
+    #[test]
+    fn keyed_hash_decode_rejects_truncated_auth_block() -> Result<(), Error> {
+        let topic: Topic = "/chat/v1".try_into()?;
+        let wp = sample_keyed_wire_piece();
+        let bytes = encode::<KeyedHashAuthenticator>(&topic, 3, 4, &wp)?;
+        // Drop the last byte of the tag block.
+        let header_end = 1 + topic.as_bytes().len() + KB_LEN + 32 + 32;
+        let truncated = bytes
+            .get(..header_end - 1)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        expect_pubsub_rejection(decode::<KeyedHashAuthenticator>(&truncated))
+    }
+
+    #[test]
     fn decode_rejects_truncated_header() -> Result<(), Error> {
-        expect_pubsub_rejection(decode(&[5u8, b'x']))
+        expect_pubsub_rejection(decode::<NullAuthenticator>(&[5u8, b'x']))
     }
 
     #[test]
@@ -234,6 +317,6 @@ mod tests {
             .chain([0u8; 8])
             .chain([0u8; 4])
             .collect();
-        expect_pubsub_rejection(decode(&bad))
+        expect_pubsub_rejection(decode::<NullAuthenticator>(&bad))
     }
 }

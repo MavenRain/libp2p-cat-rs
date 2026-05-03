@@ -212,10 +212,24 @@ mod tests {
     fn expect_replay(outcome: Result<(), Error>, expected_nonce: u64) -> Result<(), Error> {
         match outcome {
             Err(Error::NoiseReplay { nonce }) if nonce == expected_nonce => Ok(()),
-            other => Err(Error::NoiseProtocol {
+            Err(
+                other @ (Error::Io(_)
+                | Error::InvalidProtocolId { .. }
+                | Error::InvalidPeerId { .. }
+                | Error::DatagramTooLarge { .. }
+                | Error::NoiseDecrypt
+                | Error::NoiseProtocol { .. }
+                | Error::NoiseReplay { .. }
+                | Error::RlncLayer { .. }
+                | Error::PubsubProtocol { .. }
+                | Error::HostState { .. }),
+            ) => Err(Error::NoiseProtocol {
                 reason: format!(
                     "expected NoiseReplay {{ nonce: {expected_nonce} }}, got {other:?}"
                 ),
+            }),
+            Ok(()) => Err(Error::NoiseProtocol {
+                reason: format!("expected NoiseReplay {{ nonce: {expected_nonce} }}, got Ok"),
             }),
         }
     }

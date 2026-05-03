@@ -35,8 +35,18 @@ fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
 fn expect_decrypt_failure(outcome: Result<(TransportState, Vec<u8>), Error>) -> Result<(), Error> {
     match outcome {
         Err(Error::NoiseDecrypt) => Ok(()),
-        other_err @ Err(_) => Err(Error::NoiseProtocol {
-            reason: format!("expected NoiseDecrypt, got {:?}", other_err.err()),
+        Err(
+            other @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseProtocol { .. }
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }),
+        ) => Err(Error::NoiseProtocol {
+            reason: format!("expected NoiseDecrypt, got {other:?}"),
         }),
         Ok((_state, _bytes)) => Err(Error::NoiseProtocol {
             reason: "expected NoiseDecrypt, got Ok".to_owned(),
@@ -50,11 +60,19 @@ fn expect_replay(
 ) -> Result<(), Error> {
     match outcome {
         Err(Error::NoiseReplay { nonce }) if nonce == expected_nonce => Ok(()),
-        other_err @ Err(_) => Err(Error::NoiseProtocol {
-            reason: format!(
-                "expected NoiseReplay {{ nonce: {expected_nonce} }}, got {:?}",
-                other_err.err()
-            ),
+        Err(
+            other @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseDecrypt
+            | Error::NoiseProtocol { .. }
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }),
+        ) => Err(Error::NoiseProtocol {
+            reason: format!("expected NoiseReplay {{ nonce: {expected_nonce} }}, got {other:?}"),
         }),
         Ok((_state, _bytes)) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseReplay, got Ok at nonce {expected_nonce}"),
@@ -67,8 +85,18 @@ fn expect_protocol_violation(
 ) -> Result<(), Error> {
     match outcome {
         Err(Error::NoiseProtocol { .. }) => Ok(()),
-        other_err @ Err(_) => Err(Error::NoiseProtocol {
-            reason: format!("expected NoiseProtocol, got {:?}", other_err.err()),
+        Err(
+            other @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseDecrypt
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }),
+        ) => Err(Error::NoiseProtocol {
+            reason: format!("expected NoiseProtocol, got {other:?}"),
         }),
         Ok((_state, _bytes)) => Err(Error::NoiseProtocol {
             reason: "expected NoiseProtocol, got Ok".to_owned(),
