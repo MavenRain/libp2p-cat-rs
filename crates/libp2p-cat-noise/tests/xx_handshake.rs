@@ -46,7 +46,8 @@ fn expect_noise_protocol<T>(outcome: Result<T, Error>) -> Result<(), Error> {
             | Error::NoiseReplay { .. }
             | Error::RlncLayer { .. }
             | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }),
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
         ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseProtocol, got error {other:?}"),
         }),
@@ -68,7 +69,8 @@ fn expect_noise_decrypt<T>(outcome: Result<T, Error>) -> Result<(), Error> {
             | Error::NoiseReplay { .. }
             | Error::RlncLayer { .. }
             | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }),
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
         ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseDecrypt, got error {other:?}"),
         }),

@@ -78,6 +78,15 @@ pub enum Error {
         /// Description of the violation.
         reason: String,
     },
+
+    /// An identity-layer verification failure: malformed Ed25519
+    /// public key bytes, signature shape mismatch, signature did not
+    /// verify against the claimed public key, or wire-format
+    /// truncation.
+    IdentityVerify {
+        /// Description of the failure.
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -104,6 +113,9 @@ impl fmt::Display for Error {
                 write!(f, "pubsub protocol violation: {reason}")
             }
             Self::HostState { reason } => write!(f, "host state violation: {reason}"),
+            Self::IdentityVerify { reason } => {
+                write!(f, "identity verification failed: {reason}")
+            }
         }
     }
 }
@@ -120,7 +132,8 @@ impl std::error::Error for Error {
             | Self::NoiseReplay { .. }
             | Self::RlncLayer { .. }
             | Self::PubsubProtocol { .. }
-            | Self::HostState { .. } => None,
+            | Self::HostState { .. }
+            | Self::IdentityVerify { .. } => None,
         }
     }
 }

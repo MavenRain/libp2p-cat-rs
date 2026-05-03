@@ -343,7 +343,8 @@ mod tests {
                 | Error::NoiseProtocol { .. }
                 | Error::NoiseReplay { .. }
                 | Error::RlncLayer { .. }
-                | Error::HostState { .. }),
+                | Error::HostState { .. }
+                | Error::IdentityVerify { .. }),
             ) => Err(Error::PubsubProtocol {
                 reason: format!("expected PubsubProtocol rejection, got {other:?}"),
             }),
@@ -415,7 +416,8 @@ mod tests {
                 | Error::NoiseProtocol { .. }
                 | Error::NoiseReplay { .. }
                 | Error::RlncLayer { .. }
-                | Error::HostState { .. }),
+                | Error::HostState { .. }
+                | Error::IdentityVerify { .. }),
             ) => Err(Error::PubsubProtocol {
                 reason: format!("expected PubsubProtocol rejection, got {other:?}"),
             }),

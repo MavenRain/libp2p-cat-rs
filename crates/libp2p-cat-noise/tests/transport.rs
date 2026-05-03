@@ -44,7 +44,8 @@ fn expect_decrypt_failure(outcome: Result<(TransportState, Vec<u8>), Error>) -> 
             | Error::NoiseReplay { .. }
             | Error::RlncLayer { .. }
             | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }),
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
         ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseDecrypt, got {other:?}"),
         }),
@@ -70,7 +71,8 @@ fn expect_replay(
             | Error::NoiseReplay { .. }
             | Error::RlncLayer { .. }
             | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }),
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
         ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseReplay {{ nonce: {expected_nonce} }}, got {other:?}"),
         }),
@@ -94,7 +96,8 @@ fn expect_protocol_violation(
             | Error::NoiseReplay { .. }
             | Error::RlncLayer { .. }
             | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }),
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
         ) => Err(Error::NoiseProtocol {
             reason: format!("expected NoiseProtocol, got {other:?}"),
         }),

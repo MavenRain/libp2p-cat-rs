@@ -26,6 +26,7 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | `libp2p-cat-types`     | `PeerId`, `UdpAddr`, `ProtocolId`, workspace `Error`.    |
 | `libp2p-cat-udp`       | `UdpTransport`: linear `Io`-shaped UDP datagram socket.  |
 | `libp2p-cat-noise`     | Noise XX handshake + AEAD transport over datagrams.      |
+| `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding: `SignedStaticKey` payload.     |
 | `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop.       |
 | `libp2p-cat-pubsub`    | `PubsubMux` over `Host`: kind-byte multiplexed app data + RLNC pubsub with source / decoder / relay roles. |
 | `libp2p-cat-rs`        | Top-level umbrella re-exporting the four layers above.   |
@@ -52,7 +53,6 @@ Future:
 
 | Piece                  | Purpose                                                  |
 | ---------------------- | -------------------------------------------------------- |
-| `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding via signed-Noise-extension.     |
 | Kademlia DHT           | Peer discovery and content routing.                      |
 | NAT traversal          | Rendezvous-based UDP hole-punching.                      |
 

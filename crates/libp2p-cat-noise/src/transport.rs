@@ -222,7 +222,8 @@ mod tests {
                 | Error::NoiseReplay { .. }
                 | Error::RlncLayer { .. }
                 | Error::PubsubProtocol { .. }
-                | Error::HostState { .. }),
+                | Error::HostState { .. }
+                | Error::IdentityVerify { .. }),
             ) => Err(Error::NoiseProtocol {
                 reason: format!(
                     "expected NoiseReplay {{ nonce: {expected_nonce} }}, got {other:?}"

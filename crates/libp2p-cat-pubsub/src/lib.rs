@@ -37,13 +37,13 @@
 //!   [`PubsubMux::register_relay`] respectively.
 //! - **Pluggable authenticators** via the [`WireAuthenticator`] /
 //!   [`PubsubAuth`] traits.  Three stock impls are provided:
-//!     - [`rlnc_cat_rs::auth::NullAuthenticator`]: no auth, zero wire
+//!     - [`rlnc_cat_rs::auth::NullAuthenticator`][]: no auth, zero wire
 //!       overhead.
-//!     - [`rlnc_cat_rs::auth::KeyedHashAuthenticator`]: 32-byte
-//!       commitment + 32-byte BLAKE3-keyed-hash tag.  Not homomorphic:
+//!     - [`rlnc_cat_rs::auth::KeyedHashAuthenticator`][]: 32-byte
+//!       commitment + 32-byte BLAKE3-keyed-hash tag.  Not homomorphic;
 //!       a relay needs the shared key to re-tag recoded pieces, so
 //!       this fits permissioned networks.
-//!     - [`rlnc_cat_rs::lhs::LatticeHomomorphicAuthenticator`]:
+//!     - [`rlnc_cat_rs::lhs::LatticeHomomorphicAuthenticator`][]:
 //!       32-byte BLAKE3-fingerprint commitment + length-prefixed
 //!       `Z^m` signature.  *Homomorphic*: a relay holding only the
 //!       public transcript `(pk, metadata, σ_originals)` can re-tag
