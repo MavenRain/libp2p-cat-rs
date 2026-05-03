@@ -18,7 +18,7 @@ use libp2p_cat_noise::StaticKeypair;
 use libp2p_cat_pubsub::{MuxEvent, PubsubMux, Topic, unused_relay_rng};
 use libp2p_cat_types::{Error, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
-use rlnc_cat_rs::auth::{Authenticator, KeyedHashAuthenticator, KeyedHashCommitment};
+use rlnc_cat_rs::auth::{KeyedHashAuthenticator, KeyedHashCommitment};
 use rlnc_cat_rs::coding::piece::OriginalData;
 
 type KeyedMux = PubsubMux<KeyedHashAuthenticator>;
@@ -130,17 +130,23 @@ fn keyed_hash_relay_decodes_at_downstream() -> Result<(), Error> {
         reason: e.to_string(),
     })?;
     let piece_byte_len = data.piece_byte_len();
-    let auth_for_commit = KeyedHashAuthenticator::new(SHARED_KEY);
-    let commitment = auth_for_commit.commit(&data);
+    // Receivers must register before any piece arrives, so the
+    // commitment is computed from alice's mux ahead of broadcast.
+    let commitment = alice.commit(&data);
 
     let relay = relay.register_relay(topic.clone(), piece_count, piece_byte_len, commitment);
     let bob = bob.register_topic(topic.clone(), piece_count, piece_byte_len, commitment);
 
     // Alice broadcasts.  Source signs each piece with the shared
-    // BLAKE3 key.
-    let _alice_after = alice
+    // BLAKE3 key, and the returned commitment must match the one we
+    // registered with the receivers.
+    let (_alice_after, broadcast_commitment) = alice
         .broadcast(topic.clone(), data, piece_count, standard_basis_rng())
         .run()?;
+    check(
+        broadcast_commitment.as_bytes() == commitment.as_bytes(),
+        || "broadcast commitment differs from pre-broadcast commitment".to_owned(),
+    )?;
 
     // Relay drains piece_count datagrams.  For each, it verifies the
     // tag, recodes, re-tags with the shared key, and forwards.
@@ -236,7 +242,7 @@ fn keyed_hash_relay_rejects_wrong_commitment() -> Result<(), Error> {
     let wrong_commitment = KeyedHashCommitment::from([0xFFu8; 32]);
     let relay = relay.register_relay(topic.clone(), piece_count, piece_byte_len, wrong_commitment);
 
-    let _alice_after = alice
+    let (_alice_after, _real_commitment) = alice
         .broadcast(topic.clone(), data, piece_count, standard_basis_rng())
         .run()?;
 

@@ -157,7 +157,7 @@ fn relay_line_decodes_at_downstream() -> Result<(), Error> {
 
     // 4. Alice broadcasts piece_count frames; her only peer is the
     // relay, so all three datagrams land at the relay's inbox.
-    let _alice_after = alice
+    let (_alice_after, ()) = alice
         .broadcast(topic.clone(), data, piece_count, standard_basis_rng())
         .run()?;
 

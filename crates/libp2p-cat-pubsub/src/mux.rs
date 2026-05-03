@@ -325,6 +325,19 @@ where
     /// tagged with the mux's authenticator and prefixed with
     /// [`KIND_PUBSUB`] before encryption.
     ///
+    /// Returns the new mux paired with the generation's
+    /// [`Authenticator::Commitment`].  For non-stateful authenticators
+    /// (e.g. [`rlnc_cat_rs::auth::NullAuthenticator`],
+    /// [`rlnc_cat_rs::auth::KeyedHashAuthenticator`]) the same
+    /// commitment is recoverable via [`PubsubMux::commit`].  For
+    /// authenticators whose commitment binds per-generation signing
+    /// state (e.g. lattice-LHS), this is the only way the source can
+    /// observe its own commitment, since the receiver-side
+    /// [`PubsubMux::register_topic`] /
+    /// [`PubsubMux::register_relay`] need it out-of-band.
+    ///
+    /// [`Authenticator::Commitment`]: rlnc_cat_rs::auth::Authenticator::Commitment
+    ///
     /// # Errors
     ///
     /// - [`Error::RlncLayer`] for RLNC encoding failures.
@@ -338,14 +351,14 @@ where
         data: OriginalData,
         num_pieces: usize,
         rng_factory: F,
-    ) -> Io<Error, Self>
+    ) -> Io<Error, (Self, A::Commitment)>
     where
         F: Fn(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + Sync + 'static,
     {
         let piece_count = data.piece_count();
         let piece_byte_len = data.piece_byte_len();
         let auth_for_source = Arc::clone(&self.auth);
-        let (_commitment, stream) = source(auth_for_source, data, rng_factory);
+        let (commitment, stream) = source(auth_for_source, data, rng_factory);
         stream
             .take(num_pieces)
             .collect()
@@ -357,7 +370,9 @@ where
                     .iter()
                     .map(|wp| codec::encode::<A>(&topic, piece_count, piece_byte_len, wp))
                     .collect::<Result<Vec<Vec<u8>>, Error>>();
-                Io::suspend(move || frames).flat_map(move |frames| fan_out_all(self, frames))
+                Io::suspend(move || frames).flat_map(move |frames| {
+                    fan_out_all(self, frames).map(move |mux| (mux, commitment))
+                })
             })
     }
 
