@@ -15,6 +15,7 @@ libp2p-cat-noise = { workspace = true }
 libp2p-cat-identity = { workspace = true }
 libp2p-cat-pubsub = { workspace = true }
 libp2p-cat-host = { workspace = true }
+libp2p-cat-kad = { workspace = true }
 
 [lints]
 workspace = true

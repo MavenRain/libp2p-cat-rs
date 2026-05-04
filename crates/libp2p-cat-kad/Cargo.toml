@@ -1,0 +1,19 @@
+[package]
+name = "libp2p-cat-kad"
+description = "Kademlia DHT routing table and (eventually) RPCs for libp2p-cat-rs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+libp2p-cat-types = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
