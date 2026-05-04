@@ -12,12 +12,27 @@ use std::collections::BTreeMap;
 
 use comp_cat_rs::effect::io::Io;
 
+use libp2p_cat_identity::{Ed25519Keypair, SignedStaticKey};
 use libp2p_cat_noise::{Initiator, MESSAGE_1_LEN, Responder, StaticKeypair, StaticPublicKey};
-use libp2p_cat_types::{Error, UdpAddr};
+use libp2p_cat_types::{Error, PeerId, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
 
 use crate::event::HostEvent;
 use crate::state::{EstablishedConnection, InFlightHandshake};
+
+/// Long-lived identity bundle: the X25519 keypair Noise runs against,
+/// the precomputed Ed25519 [`SignedStaticKey`] this host sends as the
+/// XX handshake trailer, and the libp2p-compatible [`PeerId`] that
+/// binding resolves to.
+///
+/// Cloned cheaply on every event-loop step; the X25519 private key is
+/// the only secret material it carries.
+#[derive(Clone)]
+struct HostIdentity {
+    static_keypair: StaticKeypair,
+    signed_static_key: SignedStaticKey,
+    peer_id: PeerId,
+}
 
 /// Connection-managing host.
 ///
@@ -27,21 +42,45 @@ use crate::state::{EstablishedConnection, InFlightHandshake};
 #[must_use]
 pub struct Host {
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
 }
 
 impl Host {
-    /// Build a host from a bound UDP socket and a long-lived static
-    /// keypair.
-    pub fn new(socket: UdpTransport, static_keypair: StaticKeypair) -> Self {
-        Self {
+    /// Build a host from a bound UDP socket, a long-lived X25519
+    /// static keypair, and an Ed25519 identity keypair that signs the
+    /// static key.
+    ///
+    /// The signed binding is computed once and reused for every
+    /// handshake; the `identity` reference is dropped after
+    /// construction.  The caller can keep their own copy of the
+    /// keypair if they need to sign other things later.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::IdentityVerify`] if the underlying Ed25519
+    ///   `try_sign` reports a failure.  Ed25519 signing is
+    ///   deterministic per RFC 8032 and is not expected to fail in
+    ///   practice; the error path exists to keep this layer
+    ///   panic-free.
+    pub fn new(
+        socket: UdpTransport,
+        static_keypair: StaticKeypair,
+        identity: &Ed25519Keypair,
+    ) -> Result<Self, Error> {
+        let signed_static_key = SignedStaticKey::create(identity, static_keypair.public())?;
+        let peer_id = identity.peer_id();
+        Ok(Self {
             socket,
-            static_keypair,
+            identity: HostIdentity {
+                static_keypair,
+                signed_static_key,
+                peer_id,
+            },
             handshakes: BTreeMap::new(),
             established: BTreeMap::new(),
-        }
+        })
     }
 
     /// Borrow the underlying socket (read-only).
@@ -49,9 +88,21 @@ impl Host {
         &self.socket
     }
 
-    /// Borrow the host's long-lived static public key.
+    /// Borrow the host's long-lived X25519 static public key.
     pub fn static_public(&self) -> &StaticPublicKey {
-        self.static_keypair.public()
+        self.identity.static_keypair.public()
+    }
+
+    /// Borrow the host's libp2p-compatible [`PeerId`].
+    pub fn peer_id(&self) -> &PeerId {
+        &self.identity.peer_id
+    }
+
+    /// Borrow the host's precomputed [`SignedStaticKey`] binding.
+    /// Useful for peers that want to record the same payload they
+    /// will see in the handshake trailer.
+    pub fn signed_static_key(&self) -> &SignedStaticKey {
+        &self.identity.signed_static_key
     }
 
     /// Local UDP address.
@@ -88,6 +139,13 @@ impl Host {
         self.established.get(&addr).map(|conn| &conn.remote_static)
     }
 
+    /// The remote peer's libp2p-compatible [`PeerId`] for `addr`, if
+    /// the connection is established.
+    #[must_use]
+    pub fn remote_peer_id_of(&self, addr: UdpAddr) -> Option<&PeerId> {
+        self.established.get(&addr).map(|conn| &conn.remote_peer_id)
+    }
+
     /// A snapshot of every peer address with an established
     /// post-handshake transport.
     ///
@@ -114,7 +172,7 @@ impl Host {
         Io::suspend(move || prepare_dial(self, addr, ephemeral_seed)).flat_map(move |prepared| {
             let DialPrepared {
                 socket,
-                static_keypair,
+                identity,
                 handshakes,
                 established,
                 after_e,
@@ -125,7 +183,7 @@ impl Host {
                 handshakes.insert(addr, InFlightHandshake::InitiatorAwaitingResponse(after_e));
                 Self {
                     socket,
-                    static_keypair,
+                    identity,
                     handshakes,
                     established,
                 }
@@ -145,7 +203,7 @@ impl Host {
         Io::suspend(move || prepare_send(self, addr, &plaintext)).flat_map(move |prepared| {
             let SendPrepared {
                 socket,
-                static_keypair,
+                identity,
                 handshakes,
                 mut established,
                 conn,
@@ -154,7 +212,7 @@ impl Host {
             established.insert(addr, conn);
             socket.send(addr, datagram).map(move |socket| Self {
                 socket,
-                static_keypair,
+                identity,
                 handshakes,
                 established,
             })
@@ -171,21 +229,21 @@ impl Host {
     ///
     /// Underlying socket failures propagate as `Err`.  Per-peer
     /// problems (decrypt failures, malformed handshakes, replays,
-    /// out-of-state datagrams) surface as
+    /// out-of-state datagrams, identity-binding rejection) surface as
     /// [`HostEvent::Rejected`] rather than `Err`, so a long-running
     /// loop survives misbehaving peers.
     #[must_use]
     pub fn recv_one(self, ephemeral_seed: [u8; 32]) -> Io<Error, (Self, HostEvent)> {
         let Self {
             socket,
-            static_keypair,
+            identity,
             handshakes,
             established,
         } = self;
         socket.recv().flat_map(move |((from, datagram), socket)| {
             dispatch_inbound(
                 socket,
-                static_keypair,
+                identity,
                 handshakes,
                 established,
                 from,
@@ -199,7 +257,7 @@ impl Host {
 /// Bundled output of [`prepare_dial`].
 struct DialPrepared {
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
     after_e: libp2p_cat_noise::InitiatorAfterE,
@@ -215,7 +273,7 @@ fn prepare_dial(
 ) -> Result<DialPrepared, Error> {
     let Host {
         socket,
-        static_keypair,
+        identity,
         handshakes,
         established,
     } = host;
@@ -224,11 +282,11 @@ fn prepare_dial(
             reason: format!("dial: address {addr} already known to host"),
         })
     } else {
-        let initiator = Initiator::new(static_keypair.clone());
+        let initiator = Initiator::new(identity.static_keypair.clone());
         let (after_e, msg1) = initiator.write_e(ephemeral_seed)?;
         Ok(DialPrepared {
             socket,
-            static_keypair,
+            identity,
             handshakes,
             established,
             after_e,
@@ -240,7 +298,7 @@ fn prepare_dial(
 /// Bundled output of [`prepare_send`].
 struct SendPrepared {
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
     conn: EstablishedConnection,
@@ -252,7 +310,7 @@ struct SendPrepared {
 fn prepare_send(host: Host, addr: UdpAddr, plaintext: &[u8]) -> Result<SendPrepared, Error> {
     let Host {
         socket,
-        static_keypair,
+        identity,
         handshakes,
         mut established,
     } = host;
@@ -263,10 +321,11 @@ fn prepare_send(host: Host, addr: UdpAddr, plaintext: &[u8]) -> Result<SendPrepa
     let next_conn = EstablishedConnection {
         transport,
         remote_static: conn.remote_static,
+        remote_peer_id: conn.remote_peer_id,
     };
     Ok(SendPrepared {
         socket,
-        static_keypair,
+        identity,
         handshakes,
         established,
         conn: next_conn,
@@ -279,7 +338,7 @@ fn prepare_send(host: Host, addr: UdpAddr, plaintext: &[u8]) -> Result<SendPrepa
 /// start a responder.  Each sub-path returns a fully-rebuilt host.
 fn dispatch_inbound(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
     from: UdpAddr,
@@ -287,27 +346,13 @@ fn dispatch_inbound(
     ephemeral_seed: [u8; 32],
 ) -> Io<Error, (Host, HostEvent)> {
     if established.contains_key(&from) {
-        decrypt_established(
-            socket,
-            static_keypair,
-            handshakes,
-            established,
-            from,
-            datagram,
-        )
+        decrypt_established(socket, identity, handshakes, established, from, datagram)
     } else if handshakes.contains_key(&from) {
-        advance_in_flight(
-            socket,
-            static_keypair,
-            handshakes,
-            established,
-            from,
-            datagram,
-        )
+        advance_in_flight(socket, identity, handshakes, established, from, datagram)
     } else {
         try_responder_msg1(
             socket,
-            static_keypair,
+            identity,
             handshakes,
             established,
             from,
@@ -324,7 +369,7 @@ fn dispatch_inbound(
 #[allow(clippy::needless_pass_by_value)]
 fn decrypt_established(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     mut established: BTreeMap<UdpAddr, EstablishedConnection>,
     from: UdpAddr,
@@ -339,6 +384,7 @@ fn decrypt_established(
     Io::suspend(move || conn).map(move |conn| {
         let outcome = conn.transport.decrypt(&datagram);
         let remote_static = conn.remote_static;
+        let remote_peer_id = conn.remote_peer_id;
         match outcome {
             Ok((transport, plaintext)) => {
                 established.insert(
@@ -346,10 +392,11 @@ fn decrypt_established(
                     EstablishedConnection {
                         transport,
                         remote_static,
+                        remote_peer_id,
                     },
                 );
                 (
-                    rebuild_host(socket, static_keypair, handshakes, established),
+                    rebuild_host(socket, identity, handshakes, established),
                     HostEvent::DatagramDelivered {
                         addr: from,
                         plaintext,
@@ -364,7 +411,7 @@ fn decrypt_established(
                 // expose a non-consuming `peek_decrypt` to keep the
                 // session alive across single bad datagrams.
                 (
-                    rebuild_host(socket, static_keypair, handshakes, established),
+                    rebuild_host(socket, identity, handshakes, established),
                     HostEvent::Rejected {
                         addr: from,
                         reason: format!("transport decrypt failed: {e}; connection dropped"),
@@ -377,7 +424,7 @@ fn decrypt_established(
 
 fn advance_in_flight(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     mut handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
     from: UdpAddr,
@@ -389,7 +436,7 @@ fn advance_in_flight(
     Io::suspend(move || removed).flat_map(move |state| match state {
         InFlightHandshake::InitiatorAwaitingResponse(after_e) => initiator_consume_msg2(
             socket,
-            static_keypair,
+            identity,
             handshakes,
             established,
             from,
@@ -398,7 +445,7 @@ fn advance_in_flight(
         ),
         InFlightHandshake::ResponderAwaitingFinalize(after_resp) => responder_consume_msg3(
             socket,
-            static_keypair,
+            identity,
             handshakes,
             established,
             from,
@@ -410,7 +457,7 @@ fn advance_in_flight(
 
 fn initiator_consume_msg2(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
     from: UdpAddr,
@@ -419,27 +466,40 @@ fn initiator_consume_msg2(
 ) -> Io<Error, (Host, HostEvent)> {
     let result = after_e
         .read_response(datagram)
-        .and_then(|(after_resp, _msg2_payload)| after_resp.write_s(&[]));
+        .and_then(|(after_resp, msg2_payload)| {
+            let remote_static_for_verify = after_resp.remote_static().clone();
+            verify_binding(&msg2_payload, &remote_static_for_verify).and_then(|remote_peer_id| {
+                after_resp
+                    .write_s(&identity.signed_static_key.to_bytes())
+                    .map(|(transport, msg3, remote_static)| {
+                        (transport, msg3, remote_static, remote_peer_id)
+                    })
+            })
+        });
     match result {
-        Ok((transport, msg3, remote_static)) => socket.send(from, msg3).map(move |socket| {
-            let mut established = established;
-            established.insert(
-                from,
-                EstablishedConnection {
-                    transport,
-                    remote_static: remote_static.clone(),
-                },
-            );
-            (
-                rebuild_host(socket, static_keypair, handshakes, established),
-                HostEvent::HandshakeComplete {
-                    addr: from,
-                    remote_static,
-                },
-            )
-        }),
+        Ok((transport, msg3, remote_static, remote_peer_id)) => {
+            socket.send(from, msg3).map(move |socket| {
+                let mut established = established;
+                established.insert(
+                    from,
+                    EstablishedConnection {
+                        transport,
+                        remote_static: remote_static.clone(),
+                        remote_peer_id: remote_peer_id.clone(),
+                    },
+                );
+                (
+                    rebuild_host(socket, identity, handshakes, established),
+                    HostEvent::HandshakeComplete {
+                        addr: from,
+                        remote_static,
+                        remote_peer_id,
+                    },
+                )
+            })
+        }
         Err(e) => Io::pure((
-            rebuild_host(socket, static_keypair, handshakes, established),
+            rebuild_host(socket, identity, handshakes, established),
             HostEvent::Rejected {
                 addr: from,
                 reason: format!("initiator: failed to advance on msg2: {e}"),
@@ -450,32 +510,41 @@ fn initiator_consume_msg2(
 
 fn responder_consume_msg3(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     mut established: BTreeMap<UdpAddr, EstablishedConnection>,
     from: UdpAddr,
     after_resp: libp2p_cat_noise::ResponderAfterResponse,
     datagram: &[u8],
 ) -> Io<Error, (Host, HostEvent)> {
-    match after_resp.read_s(datagram) {
-        Ok((transport, remote_static, _msg3_payload)) => {
+    let outcome =
+        after_resp
+            .read_s(datagram)
+            .and_then(|(transport, remote_static, msg3_payload)| {
+                verify_binding(&msg3_payload, &remote_static)
+                    .map(|remote_peer_id| (transport, remote_static, remote_peer_id))
+            });
+    match outcome {
+        Ok((transport, remote_static, remote_peer_id)) => {
             established.insert(
                 from,
                 EstablishedConnection {
                     transport,
                     remote_static: remote_static.clone(),
+                    remote_peer_id: remote_peer_id.clone(),
                 },
             );
             Io::pure((
-                rebuild_host(socket, static_keypair, handshakes, established),
+                rebuild_host(socket, identity, handshakes, established),
                 HostEvent::HandshakeComplete {
                     addr: from,
                     remote_static,
+                    remote_peer_id,
                 },
             ))
         }
         Err(e) => Io::pure((
-            rebuild_host(socket, static_keypair, handshakes, established),
+            rebuild_host(socket, identity, handshakes, established),
             HostEvent::Rejected {
                 addr: from,
                 reason: format!("responder: failed to finalize on msg3: {e}"),
@@ -486,7 +555,7 @@ fn responder_consume_msg3(
 
 fn try_responder_msg1(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
     from: UdpAddr,
@@ -494,10 +563,11 @@ fn try_responder_msg1(
     ephemeral_seed: [u8; 32],
 ) -> Io<Error, (Host, HostEvent)> {
     if datagram.len() == MESSAGE_1_LEN {
-        let responder = Responder::new(static_keypair.clone());
+        let responder = Responder::new(identity.static_keypair.clone());
+        let trailer = identity.signed_static_key.to_bytes();
         match responder
             .read_e(datagram)
-            .and_then(|after_e| after_e.write_response(ephemeral_seed, &[]))
+            .and_then(|after_e| after_e.write_response(ephemeral_seed, &trailer))
         {
             Ok((after_resp, msg2)) => socket.send(from, msg2).map(move |socket| {
                 let mut handshakes = handshakes;
@@ -506,12 +576,12 @@ fn try_responder_msg1(
                     InFlightHandshake::ResponderAwaitingFinalize(after_resp),
                 );
                 (
-                    rebuild_host(socket, static_keypair, handshakes, established),
+                    rebuild_host(socket, identity, handshakes, established),
                     HostEvent::HandshakeProgress { addr: from },
                 )
             }),
             Err(e) => Io::pure((
-                rebuild_host(socket, static_keypair, handshakes, established),
+                rebuild_host(socket, identity, handshakes, established),
                 HostEvent::Rejected {
                     addr: from,
                     reason: format!("responder: failed to start handshake: {e}"),
@@ -520,7 +590,7 @@ fn try_responder_msg1(
         }
     } else {
         Io::pure((
-            rebuild_host(socket, static_keypair, handshakes, established),
+            rebuild_host(socket, identity, handshakes, established),
             HostEvent::Rejected {
                 addr: from,
                 reason: format!(
@@ -532,15 +602,24 @@ fn try_responder_msg1(
     }
 }
 
+/// Parse the handshake-trailer bytes as a [`SignedStaticKey`] and
+/// verify that it binds the X25519 static key Noise just
+/// authenticated.  Returns the resulting [`PeerId`] on success.
+fn verify_binding(payload: &[u8], remote_static: &StaticPublicKey) -> Result<PeerId, Error> {
+    let signed = SignedStaticKey::from_bytes(payload)?;
+    let (_pk, peer_id) = signed.verify(remote_static)?;
+    Ok(peer_id)
+}
+
 fn rebuild_host(
     socket: UdpTransport,
-    static_keypair: StaticKeypair,
+    identity: HostIdentity,
     handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
     established: BTreeMap<UdpAddr, EstablishedConnection>,
 ) -> Host {
     Host {
         socket,
-        static_keypair,
+        identity,
         handshakes,
         established,
     }

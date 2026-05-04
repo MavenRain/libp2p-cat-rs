@@ -11,8 +11,9 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use libp2p_cat_host::{Host, HostEvent};
+use libp2p_cat_identity::Ed25519Keypair;
 use libp2p_cat_noise::{StaticKeypair, StaticPublicKey};
-use libp2p_cat_types::{Error, UdpAddr};
+use libp2p_cat_types::{Error, PeerId, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
 
 fn loopback_v4() -> UdpAddr {
@@ -33,7 +34,10 @@ fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
 fn expect_handshake_progress(event: HostEvent, expected_addr: UdpAddr) -> Result<(), Error> {
     match event {
         HostEvent::HandshakeProgress { addr } if addr == expected_addr => Ok(()),
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeProgress({expected_addr}), got {other:?}"),
         }),
     }
@@ -42,13 +46,17 @@ fn expect_handshake_progress(event: HostEvent, expected_addr: UdpAddr) -> Result
 fn expect_handshake_complete(
     event: HostEvent,
     expected_addr: UdpAddr,
-) -> Result<StaticPublicKey, Error> {
+) -> Result<(StaticPublicKey, PeerId), Error> {
     match event {
         HostEvent::HandshakeComplete {
             addr,
             remote_static,
-        } if addr == expected_addr => Ok(remote_static),
-        other => Err(Error::HostState {
+            remote_peer_id,
+        } if addr == expected_addr => Ok((remote_static, remote_peer_id)),
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeComplete({expected_addr}), got {other:?}"),
         }),
     }
@@ -57,7 +65,10 @@ fn expect_handshake_complete(
 fn expect_rejected(event: HostEvent, expected_addr: UdpAddr) -> Result<String, Error> {
     match event {
         HostEvent::Rejected { addr, reason } if addr == expected_addr => Ok(reason),
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected Rejected({expected_addr}), got {other:?}"),
         }),
     }
@@ -72,11 +83,15 @@ fn two_hosts_complete_xx_handshake_over_loopback() -> Result<(), Error> {
 
     let alice_kp = StaticKeypair::from_private_bytes([0xA1; 32]);
     let bob_kp = StaticKeypair::from_private_bytes([0xB2; 32]);
+    let alice_id = Ed25519Keypair::from_seed([0x11; 32]);
+    let bob_id = Ed25519Keypair::from_seed([0x22; 32]);
     let alice_pub = alice_kp.public().clone();
     let bob_pub = bob_kp.public().clone();
+    let alice_peer_id = alice_id.peer_id();
+    let bob_peer_id = bob_id.peer_id();
 
     // Step 1: Alice dials Bob (sends msg1).
-    let alice_host = Host::new(alice_socket, alice_kp)
+    let alice_host = Host::new(alice_socket, alice_kp, &alice_id)?
         .dial(bob_addr, [0xE1; 32])
         .run()?;
     check(alice_host.handshakes_in_flight() == 1, || {
@@ -93,7 +108,7 @@ fn two_hosts_complete_xx_handshake_over_loopback() -> Result<(), Error> {
     })?;
 
     // Step 2: Bob receives msg1, writes msg2 → HandshakeProgress.
-    let bob_host = Host::new(bob_socket, bob_kp);
+    let bob_host = Host::new(bob_socket, bob_kp, &bob_id)?;
     let (bob_host, ev_bob_1) = bob_host.recv_one([0xE2; 32]).run()?;
     expect_handshake_progress(ev_bob_1, alice_addr)?;
     check(bob_host.handshakes_in_flight() == 1, || {
@@ -105,9 +120,13 @@ fn two_hosts_complete_xx_handshake_over_loopback() -> Result<(), Error> {
 
     // Step 3: Alice receives msg2, writes msg3 → HandshakeComplete.
     let (alice_host, ev_alice_1) = alice_host.recv_one([0; 32]).run()?;
-    let alice_observed_bob = expect_handshake_complete(ev_alice_1, bob_addr)?;
+    let (alice_observed_bob, alice_observed_bob_peer) =
+        expect_handshake_complete(ev_alice_1, bob_addr)?;
     check(alice_observed_bob == bob_pub, || {
         "alice's view of bob's static key does not match".to_owned()
+    })?;
+    check(alice_observed_bob_peer == bob_peer_id, || {
+        "alice's view of bob's peer id does not match".to_owned()
     })?;
     check(alice_host.handshakes_in_flight() == 0, || {
         "alice should have no in-flight handshakes after completion".to_owned()
@@ -121,9 +140,13 @@ fn two_hosts_complete_xx_handshake_over_loopback() -> Result<(), Error> {
 
     // Step 4: Bob receives msg3 → HandshakeComplete.
     let (bob_host, ev_bob_2) = bob_host.recv_one([0; 32]).run()?;
-    let bob_observed_alice = expect_handshake_complete(ev_bob_2, alice_addr)?;
+    let (bob_observed_alice, bob_observed_alice_peer) =
+        expect_handshake_complete(ev_bob_2, alice_addr)?;
     check(bob_observed_alice == alice_pub, || {
         "bob's view of alice's static key does not match".to_owned()
+    })?;
+    check(bob_observed_alice_peer == alice_peer_id, || {
+        "bob's view of alice's peer id does not match".to_owned()
     })?;
     check(bob_host.handshakes_in_flight() == 0, || {
         "bob should have no in-flight handshakes after completion".to_owned()
@@ -147,7 +170,8 @@ fn dial_rejects_duplicate_address() -> Result<(), Error> {
     let _bob_keep = bob_socket;
 
     let alice_kp = StaticKeypair::from_private_bytes([0xA1; 32]);
-    let alice_host = Host::new(alice_socket, alice_kp)
+    let alice_id = Ed25519Keypair::from_seed([0x11; 32]);
+    let alice_host = Host::new(alice_socket, alice_kp, &alice_id)?
         .dial(bob_addr, [0xE1; 32])
         .run()?;
 
@@ -176,8 +200,65 @@ fn fresh_garbage_datagram_is_rejected_not_errored() -> Result<(), Error> {
     drop(alice_socket);
 
     let bob_kp = StaticKeypair::from_private_bytes([0xB2; 32]);
-    let bob_host = Host::new(bob_socket, bob_kp);
+    let bob_id = Ed25519Keypair::from_seed([0x22; 32]);
+    let bob_host = Host::new(bob_socket, bob_kp, &bob_id)?;
     let (_bob_host, ev) = bob_host.recv_one([0xE2; 32]).run()?;
     let _reason = expect_rejected(ev, alice_addr)?;
     Ok(())
+}
+
+#[test]
+fn responder_rejects_initiator_with_empty_identity_trailer() -> Result<(), Error> {
+    // An attacker that drives Noise XX without sending a SignedStaticKey
+    // trailer (empty payload, the libp2p-cat-noise-only path) must not
+    // be able to establish with a Host.  The host computes a verified
+    // PeerId from the trailer; absence is fail-closed.
+    use libp2p_cat_noise::Initiator;
+
+    let attacker_socket = UdpTransport::bind(loopback_v4()).run()?;
+    let bob_socket = UdpTransport::bind(loopback_v4()).run()?;
+    let attacker_addr = attacker_socket.local_addr()?;
+    let bob_addr = bob_socket.local_addr()?;
+
+    let attacker_kp = StaticKeypair::from_private_bytes([0x91; 32]);
+    let bob_kp = StaticKeypair::from_private_bytes([0xB2; 32]);
+    let bob_id = Ed25519Keypair::from_seed([0x22; 32]);
+
+    // Drive the attacker side by hand; the noise crate still accepts
+    // empty trailers, so the wire flow completes from Noise's view.
+    let (attacker_after_e, msg1) = Initiator::new(attacker_kp).write_e([0xE1; 32])?;
+    let attacker_socket = attacker_socket.send(bob_addr, msg1).run()?;
+
+    // Bob's host consumes msg1 and writes msg2 (with its real identity
+    // trailer) -> HandshakeProgress.
+    let bob_host = Host::new(bob_socket, bob_kp, &bob_id)?;
+    let (bob_host, ev_progress) = bob_host.recv_one([0xE2; 32]).run()?;
+    expect_handshake_progress(ev_progress, attacker_addr)?;
+
+    // Attacker reads Bob's msg2 and writes msg3 with an empty trailer.
+    let (msg2, attacker_socket) = recv_one_from(attacker_socket)?;
+    let (attacker_after_resp, _bob_payload) = attacker_after_e.read_response(&msg2)?;
+    let (_attacker_transport, msg3, _bob_static) = attacker_after_resp.write_s(&[])?;
+    let _attacker_socket = attacker_socket.send(bob_addr, msg3).run()?;
+
+    // Bob receives msg3.  The noise layer accepts (transport derives
+    // OK), but the empty trailer fails to parse as a SignedStaticKey,
+    // so Host surfaces Rejected, and the connection is not
+    // established.
+    let (bob_host, ev_reject) = bob_host.recv_one([0; 32]).run()?;
+    let reason = expect_rejected(ev_reject, attacker_addr)?;
+    check(
+        reason.contains("identity verification failed")
+            || reason.contains("SignedStaticKey")
+            || reason.contains("IdentityVerify"),
+        || format!("rejection reason did not mention identity: {reason}"),
+    )?;
+    check(!bob_host.is_established(attacker_addr), || {
+        "bob should not have established with attacker that sent empty trailer".to_owned()
+    })
+}
+
+fn recv_one_from(socket: UdpTransport) -> Result<(Vec<u8>, UdpTransport), Error> {
+    let ((_from, datagram), socket) = socket.recv().run()?;
+    Ok((datagram, socket))
 }

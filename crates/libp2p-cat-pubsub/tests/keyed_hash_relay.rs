@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libp2p_cat_host::Host;
+use libp2p_cat_identity::Ed25519Keypair;
 use libp2p_cat_noise::StaticKeypair;
 use libp2p_cat_pubsub::{MuxEvent, PubsubMux, Topic, unused_relay_rng};
 use libp2p_cat_types::{Error, UdpAddr};
@@ -41,8 +42,12 @@ fn build_mux(seed: u8) -> Result<(KeyedMux, UdpAddr), Error> {
     let socket = UdpTransport::bind(loopback_v4()).run()?;
     let addr = socket.local_addr()?;
     let keypair = StaticKeypair::from_private_bytes([seed; 32]);
+    let identity = Ed25519Keypair::from_seed([seed.wrapping_add(1); 32]);
     let auth = Arc::new(KeyedHashAuthenticator::new(SHARED_KEY));
-    Ok((PubsubMux::new(Host::new(socket, keypair), auth), addr))
+    Ok((
+        PubsubMux::new(Host::new(socket, keypair, &identity)?, auth),
+        addr,
+    ))
 }
 
 fn expect_handshake_progress(ev: MuxEvent, expected_addr: UdpAddr) -> Result<(), Error> {

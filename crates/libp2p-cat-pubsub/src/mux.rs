@@ -54,7 +54,7 @@ use comp_cat_rs::effect::io::Io;
 
 use libp2p_cat_host::{Host, HostEvent};
 use libp2p_cat_noise::StaticPublicKey;
-use libp2p_cat_types::{Error, UdpAddr};
+use libp2p_cat_types::{Error, PeerId, UdpAddr};
 
 use rlnc_cat_rs::coding::decode::DecoderState;
 use rlnc_cat_rs::coding::piece::{CodedPiece, OriginalData};
@@ -124,12 +124,16 @@ pub enum MuxEvent {
         addr: UdpAddr,
     },
 
-    /// Pass-through: a handshake completed.
+    /// Pass-through: a handshake completed and the peer's identity
+    /// binding verified against the X25519 key Noise authenticated.
     HandshakeComplete {
         /// Peer address.
         addr: UdpAddr,
         /// Authenticated remote static public key.
         remote_static: StaticPublicKey,
+        /// The peer's libp2p-compatible [`PeerId`], derived from the
+        /// verified `SignedStaticKey` trailer in the handshake.
+        remote_peer_id: PeerId,
     },
 
     /// An inbound datagram was rejected.  Also emitted when a kind
@@ -537,6 +541,7 @@ where
         HostEvent::HandshakeComplete {
             addr,
             remote_static,
+            remote_peer_id,
         } => Io::pure((
             PubsubMux {
                 host,
@@ -547,6 +552,7 @@ where
             MuxEvent::HandshakeComplete {
                 addr,
                 remote_static,
+                remote_peer_id,
             },
         )),
         HostEvent::Rejected { addr, reason } => Io::pure((

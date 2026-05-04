@@ -16,6 +16,7 @@ libp2p-cat-noise = { workspace = true }
 libp2p-cat-host = { workspace = true }
 
 [dev-dependencies]
+libp2p-cat-identity = { workspace = true }
 libp2p-cat-udp = { workspace = true }
 
 [lints]

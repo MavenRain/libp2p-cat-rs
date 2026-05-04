@@ -12,6 +12,7 @@ homepage.workspace = true
 libp2p-cat-types = { workspace = true }
 libp2p-cat-udp = { workspace = true }
 libp2p-cat-noise = { workspace = true }
+libp2p-cat-identity = { workspace = true }
 libp2p-cat-pubsub = { workspace = true }
 libp2p-cat-host = { workspace = true }
 

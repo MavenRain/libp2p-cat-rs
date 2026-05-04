@@ -2,6 +2,7 @@
 //! established post-handshake transports.  Not exposed publicly.
 
 use libp2p_cat_noise::{InitiatorAfterE, ResponderAfterResponse, StaticPublicKey, TransportState};
+use libp2p_cat_types::PeerId;
 
 /// A handshake that has sent its first message and is waiting on the
 /// remote to advance it.  Two stable shapes; transient intermediate
@@ -18,4 +19,5 @@ pub(crate) enum InFlightHandshake {
 pub(crate) struct EstablishedConnection {
     pub transport: TransportState,
     pub remote_static: StaticPublicKey,
+    pub remote_peer_id: PeerId,
 }

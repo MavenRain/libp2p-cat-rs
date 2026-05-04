@@ -51,6 +51,10 @@
 #![forbid(unsafe_code)]
 
 pub use libp2p_cat_host::{Host, HostEvent};
+pub use libp2p_cat_identity::{
+    DOMAIN_TAG as IDENTITY_DOMAIN_TAG, ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN,
+    Ed25519Keypair, Ed25519PublicKey, Ed25519Signature, SignedStaticKey,
+};
 pub use libp2p_cat_noise::{
     Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_OVERHEAD_LEN,
     MESSAGE_3_OVERHEAD_LEN, REPLAY_WINDOW_BITS, Responder, ResponderAfterE, ResponderAfterResponse,

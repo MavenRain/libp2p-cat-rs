@@ -20,11 +20,16 @@
 //!
 //! # Identity
 //!
-//! For demo reproducibility the static X25519 keypair is derived
-//! deterministically from the bind port (so peers can recognise each
-//! other across runs) while ephemeral seeds come from `getrandom`.
-//! Production deployments should source the static key from a real
-//! key store instead.
+//! For demo reproducibility both the static X25519 keypair and the
+//! Ed25519 identity keypair are derived deterministically from the
+//! bind port (so peers can recognise each other across runs) while
+//! ephemeral seeds come from `getrandom`.  Each peer prints the
+//! [`PeerId`] derived from its own identity at startup, and the
+//! peer's [`PeerId`] (verified against the X25519 key Noise
+//! authenticated) on `HandshakeComplete`.  Production deployments
+//! should source both keys from a real key store instead.
+//!
+//! [`PeerId`]: libp2p_cat_rs::PeerId
 
 use std::env;
 use std::io::{BufRead, Write, stdin, stdout};
@@ -32,7 +37,9 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use libp2p_cat_rs::{Error, Host, HostEvent, StaticKeypair, UdpAddr, UdpTransport};
+use libp2p_cat_rs::{
+    Ed25519Keypair, Error, Host, HostEvent, PeerId, StaticKeypair, UdpAddr, UdpTransport,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -50,9 +57,10 @@ fn run() -> Result<(), Error> {
     let bind = args.bind;
     let socket = UdpTransport::bind(bind).run()?;
     let keypair = derive_keypair(bind);
-    let host = Host::new(socket, keypair);
+    let identity = derive_identity(bind);
+    let host = Host::new(socket, keypair, &identity)?;
 
-    print_banner(bind, args.peer.as_ref())?;
+    print_banner(bind, args.peer.as_ref(), host.peer_id())?;
 
     let (host, peer_addr, first_turn) = match args.peer {
         Some(remote) => initiator_handshake(host, remote).map(|h| (h, remote, Turn::Send))?,
@@ -100,13 +108,25 @@ fn parse_addr(s: &str) -> Result<UdpAddr, Error> {
 /// Stable static keypair derived from the bind port so two instances
 /// running on different ports recognise each other across restarts.
 fn derive_keypair(addr: UdpAddr) -> StaticKeypair {
+    StaticKeypair::from_private_bytes(seed_from_port(addr, 0xC0))
+}
+
+/// Stable Ed25519 identity keypair derived from the bind port,
+/// domain-separated from the X25519 static seed.
+fn derive_identity(addr: UdpAddr) -> Ed25519Keypair {
+    Ed25519Keypair::from_seed(seed_from_port(addr, 0xED))
+}
+
+fn seed_from_port(addr: UdpAddr, domain: u8) -> [u8; 32] {
     let port = match addr {
         UdpAddr::V4(s) => s.port(),
         UdpAddr::V6(s) => s.port(),
     };
     let port_bytes = port.to_be_bytes();
-    let seed: [u8; 32] = core::array::from_fn(|i| port_bytes.get(i).copied().unwrap_or(0));
-    StaticKeypair::from_private_bytes(seed)
+    core::array::from_fn(|i| match i {
+        0 => domain,
+        j => port_bytes.get(j - 1).copied().unwrap_or(0),
+    })
 }
 
 fn fresh_seed() -> Result<[u8; 32], Error> {
@@ -117,12 +137,16 @@ fn fresh_seed() -> Result<[u8; 32], Error> {
     Ok(seed)
 }
 
-fn print_banner(bind: UdpAddr, peer: Option<&UdpAddr>) -> Result<(), Error> {
+fn print_banner(bind: UdpAddr, peer: Option<&UdpAddr>, peer_id: &PeerId) -> Result<(), Error> {
     let role = match peer {
         Some(p) => format!("dialer (will reach {p})"),
         None => "listener (waiting for incoming dial)".to_owned(),
     };
-    writeln!(stdout(), "libp2p-cat-rs chat: bound to {bind} as {role}").map_err(Error::from)?;
+    writeln!(
+        stdout(),
+        "libp2p-cat-rs chat: bound to {bind} as {role}\nlocal peer id = {peer_id}"
+    )
+    .map_err(Error::from)?;
     Ok(())
 }
 
@@ -133,11 +157,15 @@ fn initiator_handshake(host: Host, peer: UdpAddr) -> Result<Host, Error> {
         HostEvent::HandshakeComplete {
             addr,
             remote_static,
+            remote_peer_id,
         } if addr == peer => {
-            announce_handshake(&remote_static)?;
+            announce_handshake(&remote_static, &remote_peer_id)?;
             Ok(host)
         }
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeComplete from {peer}, got {other:?}"),
         }),
     }
@@ -147,7 +175,9 @@ fn responder_handshake(host: Host) -> Result<(Host, UdpAddr), Error> {
     let (host, ev1) = host.recv_one(fresh_seed()?).run()?;
     let peer = match ev1 {
         HostEvent::HandshakeProgress { addr } => Ok(addr),
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeProgress, got {other:?}"),
         }),
     }?;
@@ -156,20 +186,27 @@ fn responder_handshake(host: Host) -> Result<(Host, UdpAddr), Error> {
         HostEvent::HandshakeComplete {
             addr,
             remote_static,
+            remote_peer_id,
         } if addr == peer => {
-            announce_handshake(&remote_static)?;
+            announce_handshake(&remote_static, &remote_peer_id)?;
             Ok((host, peer))
         }
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeComplete from {peer}, got {other:?}"),
         }),
     }
 }
 
-fn announce_handshake(remote_static: &libp2p_cat_rs::StaticPublicKey) -> Result<(), Error> {
+fn announce_handshake(
+    remote_static: &libp2p_cat_rs::StaticPublicKey,
+    remote_peer_id: &PeerId,
+) -> Result<(), Error> {
     writeln!(
         stdout(),
-        "handshake complete; remote static = {:02x?}",
+        "handshake complete\n  remote peer id = {remote_peer_id}\n  remote static  = {:02x?}",
         remote_static.as_bytes()
     )
     .map_err(Error::from)?;

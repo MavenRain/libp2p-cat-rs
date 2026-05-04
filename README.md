@@ -25,9 +25,9 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | ---------------------- | -------------------------------------------------------- |
 | `libp2p-cat-types`     | `PeerId`, `UdpAddr`, `ProtocolId`, workspace `Error`.    |
 | `libp2p-cat-udp`       | `UdpTransport`: linear `Io`-shaped UDP datagram socket.  |
-| `libp2p-cat-noise`     | Noise XX handshake + AEAD transport over datagrams.      |
-| `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding: `SignedStaticKey` payload.     |
-| `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop.       |
+| `libp2p-cat-noise`     | Noise XX handshake + AEAD transport over datagrams; messages 2 and 3 carry an arbitrary encrypted trailer. |
+| `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding: `SignedStaticKey` payload (96 bytes) carried as the XX handshake trailer. |
+| `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop; verifies every peer's identity binding and surfaces the resolved `PeerId` on `HandshakeComplete`. |
 | `libp2p-cat-pubsub`    | `PubsubMux` over `Host`: kind-byte multiplexed app data + RLNC pubsub with source / decoder / relay roles. |
 | `libp2p-cat-rs`        | Top-level umbrella re-exporting the four layers above.   |
 

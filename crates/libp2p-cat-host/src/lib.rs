@@ -2,11 +2,19 @@
 //! plaintext datagrams.
 //!
 //! A [`Host`] owns one [`UdpTransport`], a long-lived
-//! [`StaticKeypair`] (X25519 only — Ed25519 ↔ X25519 binding via the
-//! libp2p signed-Noise-extension is deferred), and two address-keyed
-//! tables: handshakes still in flight, and post-handshake transport
-//! states.  All effectful operations consume `self` and return a new
-//! host; nothing mutates in place.
+//! [`StaticKeypair`], and a precomputed [`SignedStaticKey`] binding
+//! that ties the X25519 static key to an [`Ed25519Keypair`] identity.
+//! Every Noise XX handshake the host runs sends the binding as the
+//! encrypted trailer of message 2 (responder side) or message 3
+//! (initiator side); the remote's binding is verified against the
+//! X25519 key Noise authenticates, so [`HostEvent::HandshakeComplete`]
+//! always carries a verified libp2p-compatible
+//! [`PeerId`](libp2p_cat_types::PeerId).  A peer that fails to send a
+//! valid binding is rejected.
+//!
+//! Two address-keyed tables track in-flight handshakes and
+//! post-handshake transport states.  All effectful operations consume
+//! `self` and return a new host; nothing mutates in place.
 //!
 //! # Event-loop shape
 //!
@@ -15,8 +23,8 @@
 //!     let (host, event) = host.recv_one(next_seed()).run()?;
 //!     match event {
 //!         HostEvent::HandshakeProgress { .. }   => /* wait for next datagram */,
-//!         HostEvent::HandshakeComplete { addr, remote_static } => {
-//!             // peer authenticated; record (addr, remote_static)
+//!         HostEvent::HandshakeComplete { addr, remote_static, remote_peer_id } => {
+//!             // peer authenticated; record (addr, remote_peer_id)
 //!         }
 //!         HostEvent::DatagramDelivered { addr, plaintext } => {
 //!             // application-level handling
@@ -37,6 +45,8 @@
 //!
 //! [`UdpTransport`]: libp2p_cat_udp::UdpTransport
 //! [`StaticKeypair`]: libp2p_cat_noise::StaticKeypair
+//! [`SignedStaticKey`]: libp2p_cat_identity::SignedStaticKey
+//! [`Ed25519Keypair`]: libp2p_cat_identity::Ed25519Keypair
 
 #![forbid(unsafe_code)]
 

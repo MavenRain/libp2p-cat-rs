@@ -7,7 +7,7 @@
 //! between fatal I/O failures and a single misbehaving peer.
 
 use libp2p_cat_noise::StaticPublicKey;
-use libp2p_cat_types::UdpAddr;
+use libp2p_cat_types::{PeerId, UdpAddr};
 
 /// What happened while processing one inbound datagram.
 #[derive(Clone, Debug)]
@@ -22,17 +22,22 @@ pub enum HostEvent {
         addr: UdpAddr,
     },
 
-    /// A handshake completed.  The peer is now in the host's
-    /// `established` table and a [`StaticPublicKey`] authenticated
-    /// during the handshake is reported.
+    /// A handshake completed and the peer's
+    /// [`libp2p_cat_identity::SignedStaticKey`] binding verified
+    /// against the X25519 static key Noise authenticated.  The peer
+    /// is now in the host's `established` table.
+    ///
+    /// [`libp2p_cat_identity::SignedStaticKey`]: https://docs.rs/libp2p-cat-identity
     HandshakeComplete {
         /// Address of the peer.
         addr: UdpAddr,
         /// The peer's authenticated long-lived X25519 static public
-        /// key.  Combine with an out-of-band identity binding (e.g.
-        /// the libp2p signed-Noise-extension, deferred for v1) to
-        /// resolve a [`libp2p_cat_types::PeerId`].
+        /// key.
         remote_static: StaticPublicKey,
+        /// The peer's libp2p-compatible [`PeerId`], derived from the
+        /// Ed25519 public key in the verified
+        /// `SignedStaticKey` trailer.
+        remote_peer_id: PeerId,
     },
 
     /// A post-handshake plaintext datagram arrived.

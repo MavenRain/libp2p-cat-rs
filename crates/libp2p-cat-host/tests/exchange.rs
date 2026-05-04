@@ -10,6 +10,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use libp2p_cat_host::{Host, HostEvent};
+use libp2p_cat_identity::Ed25519Keypair;
 use libp2p_cat_noise::StaticKeypair;
 use libp2p_cat_types::{Error, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
@@ -37,11 +38,13 @@ fn established_pair() -> Result<(Host, Host, UdpAddr, UdpAddr), Error> {
 
     let alice_kp = StaticKeypair::from_private_bytes([0xC1; 32]);
     let bob_kp = StaticKeypair::from_private_bytes([0xC2; 32]);
+    let alice_id = Ed25519Keypair::from_seed([0x31; 32]);
+    let bob_id = Ed25519Keypair::from_seed([0x32; 32]);
 
-    let alice = Host::new(alice_socket, alice_kp)
+    let alice = Host::new(alice_socket, alice_kp, &alice_id)?
         .dial(bob_addr, [0xE1; 32])
         .run()?;
-    let bob = Host::new(bob_socket, bob_kp);
+    let bob = Host::new(bob_socket, bob_kp, &bob_id)?;
     let (bob, _ev1) = bob.recv_one([0xE2; 32]).run()?;
     let (alice, _ev2) = alice.recv_one([0; 32]).run()?;
     let (bob, _ev3) = bob.recv_one([0; 32]).run()?;
@@ -72,7 +75,9 @@ fn expect_delivered(
                 "DatagramDelivered shape mismatch: addr={addr}, plaintext={plaintext:?}"
             ),
         }),
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected DatagramDelivered, got {other:?}"),
         }),
     }
@@ -81,7 +86,10 @@ fn expect_delivered(
 fn expect_rejected(event: HostEvent, expected_addr: UdpAddr) -> Result<(), Error> {
     match event {
         HostEvent::Rejected { addr, .. } if addr == expected_addr => Ok(()),
-        other => Err(Error::HostState {
+        other @ (HostEvent::HandshakeProgress { .. }
+        | HostEvent::HandshakeComplete { .. }
+        | HostEvent::DatagramDelivered { .. }
+        | HostEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected Rejected({expected_addr}), got {other:?}"),
         }),
     }
@@ -114,7 +122,8 @@ fn established_hosts_round_trip_a_message_each_way() -> Result<(), Error> {
 fn send_to_unknown_peer_errors() -> Result<(), Error> {
     let alice_socket = UdpTransport::bind(loopback_v4()).run()?;
     let alice_kp = StaticKeypair::from_private_bytes([0xD1; 32]);
-    let alice = Host::new(alice_socket, alice_kp);
+    let alice_id = Ed25519Keypair::from_seed([0x33; 32]);
+    let alice = Host::new(alice_socket, alice_kp, &alice_id)?;
 
     // bind+drop bob's socket so we have a "valid" addr to target
     let bob_socket = UdpTransport::bind(loopback_v4()).run()?;
