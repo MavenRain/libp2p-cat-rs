@@ -5,14 +5,21 @@
 //! the XOR [`Distance`] metric, k-buckets, and a [`RoutingTable`]
 //! indexed by distance.
 //!
-//! Pass 2 (this version) adds the wire side: a single-byte-opcode
-//! [`Frame`] encoding for `PING` / `FIND_NODE` RPCs, and a
-//! [`KademliaNode`] driver wrapping a [`Host`](libp2p_cat_host::Host)
-//! that auto-answers inbound `PING` and `FIND_NODE` requests, auto-
-//! inserts observed peers into the routing table, and surfaces
-//! [`KadEvent`]s for the caller to consume.  Iterative lookup
-//! (driving the `FIND_NODE` results through successive rounds of
-//! queries) is deferred to pass 3.
+//! Pass 2 added the wire side: a single-byte-opcode [`Frame`]
+//! encoding for `PING` / `FIND_NODE` RPCs, and a [`KademliaNode`]
+//! driver wrapping a [`Host`](libp2p_cat_host::Host) that auto-
+//! answers inbound `PING` and `FIND_NODE` requests, auto-inserts
+//! observed peers into the routing table, and surfaces [`KadEvent`]s
+//! for the caller to consume.
+//!
+//! Pass 3 (this version) adds [`KademliaNode::lookup_node`], a
+//! synchronous iterative `FIND_NODE` lookup that runs to completion
+//! and returns up to `k` peers closest to a target.  See
+//! [`LookupConfig`] and the [`lookup`] module for
+//! tunables and v1 limitations (in particular, the lookup only
+//! queries peers with an active established Host connection; pass 4
+//! will fold transparent dialing of newly-discovered peers into the
+//! lookup itself).
 //!
 //! # Identifier choice
 //!
@@ -40,6 +47,7 @@ mod bucket;
 mod codec;
 mod distance;
 mod event;
+pub mod lookup;
 mod node;
 mod node_id;
 mod routing_table;
@@ -48,6 +56,7 @@ pub use bucket::{Bucket, DEFAULT_K, InsertOutcome};
 pub use codec::{ENTRY_V4_LEN, ENTRY_V6_LEN, Frame, MAX_PEERS_PER_RESP, Opcode, decode, encode};
 pub use distance::Distance;
 pub use event::KadEvent;
+pub use lookup::{Lookup, LookupConfig, LookupEntry, LookupStatus};
 pub use node::KademliaNode;
 pub use node_id::{NODE_ID_BITS, NODE_ID_LEN, NodeId};
 pub use routing_table::RoutingTable;

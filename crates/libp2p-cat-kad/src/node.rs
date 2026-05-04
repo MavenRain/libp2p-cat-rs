@@ -23,6 +23,7 @@ use libp2p_cat_types::{Error, PeerId, UdpAddr};
 
 use crate::codec::{Frame, decode, encode};
 use crate::event::KadEvent;
+use crate::lookup::{LookupConfig, run_lookup};
 use crate::node_id::NodeId;
 use crate::routing_table::RoutingTable;
 
@@ -113,6 +114,46 @@ impl KademliaNode {
     #[must_use]
     pub fn find_node(self, peer: UdpAddr, target: NodeId) -> Io<Error, Self> {
         send_frame(self, peer, Frame::FindNodeReq { target })
+    }
+
+    /// Run an iterative `FIND_NODE` lookup for `target` to
+    /// completion, returning up to `config.k` peers closest to the
+    /// target.
+    ///
+    /// Pass 3's lookup is synchronous: this `Io` does not yield until
+    /// the lookup converges or `config.max_rounds` rounds elapse.
+    /// Inbound `PING` / `FIND_NODE` requests from unrelated peers are
+    /// still auto-answered by the underlying [`KademliaNode::recv_one`]
+    /// during the lookup; only the *return* from this call is
+    /// delayed.
+    ///
+    /// The lookup queries only peers that already have an established
+    /// Host connection.  Newly-discovered peers from responses are
+    /// added to the shortlist and may appear in the result, but are
+    /// not contacted in this lookup.  Pass 4 will fold transparent
+    /// dialing into the iteration.
+    ///
+    /// `seed_factory` is called once per [`KademliaNode::recv_one`]
+    /// step inside the lookup; only the seed for an unrelated fresh
+    /// peer's `msg1` is actually used, but a fresh value should be
+    /// supplied for each call regardless.
+    ///
+    /// # Errors
+    ///
+    /// Underlying socket / Noise errors propagate transparently;
+    /// per-peer issues (decrypt failure, malformed RPC) are absorbed
+    /// silently and the lookup proceeds.
+    #[must_use]
+    pub fn lookup_node<F>(
+        self,
+        target: NodeId,
+        config: LookupConfig,
+        seed_factory: F,
+    ) -> Io<Error, (Self, Vec<(NodeId, UdpAddr)>)>
+    where
+        F: Fn() -> [u8; 32] + Clone + Send + Sync + 'static,
+    {
+        run_lookup(self, target, config, seed_factory)
     }
 
     /// Receive one event.  Inbound `PING` and `FIND_NODE` requests

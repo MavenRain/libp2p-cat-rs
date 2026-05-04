@@ -58,10 +58,11 @@ pub use libp2p_cat_identity::{
 pub use libp2p_cat_kad::{
     Bucket as KadBucket, DEFAULT_K as KAD_DEFAULT_K, Distance as KadDistance,
     ENTRY_V4_LEN as KAD_ENTRY_V4_LEN, ENTRY_V6_LEN as KAD_ENTRY_V6_LEN, Frame as KadFrame,
-    InsertOutcome as KadInsertOutcome, KadEvent, KademliaNode,
-    MAX_PEERS_PER_RESP as KAD_MAX_PEERS_PER_RESP, NODE_ID_BITS as KAD_NODE_ID_BITS,
-    NODE_ID_LEN as KAD_NODE_ID_LEN, NodeId as KadNodeId, Opcode as KadOpcode,
-    RoutingTable as KadRoutingTable, decode as decode_kad_frame, encode as encode_kad_frame,
+    InsertOutcome as KadInsertOutcome, KadEvent, KademliaNode, Lookup as KadLookup, LookupConfig,
+    LookupEntry, LookupStatus, MAX_PEERS_PER_RESP as KAD_MAX_PEERS_PER_RESP,
+    NODE_ID_BITS as KAD_NODE_ID_BITS, NODE_ID_LEN as KAD_NODE_ID_LEN, NodeId as KadNodeId,
+    Opcode as KadOpcode, RoutingTable as KadRoutingTable, decode as decode_kad_frame,
+    encode as encode_kad_frame,
 };
 pub use libp2p_cat_noise::{
     Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_OVERHEAD_LEN,
