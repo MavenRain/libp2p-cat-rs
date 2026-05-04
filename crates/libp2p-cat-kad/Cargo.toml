@@ -10,9 +10,14 @@ homepage.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+comp-cat-rs = { workspace = true }
+libp2p-cat-host = { workspace = true }
+libp2p-cat-noise = { workspace = true }
 libp2p-cat-types = { workspace = true }
 
 [dev-dependencies]
+libp2p-cat-identity = { workspace = true }
+libp2p-cat-udp = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

@@ -231,14 +231,12 @@ mod tests {
             InsertOutcome::BucketFull { lru_candidate } => {
                 check(lru_candidate == id_for_byte(1), || {
                     format!("expected LRU = id_for_byte(1), got {lru_candidate}")
-                })?
+                })
             }
-            other @ (InsertOutcome::Added | InsertOutcome::Updated) => {
-                return Err(Error::HostState {
-                    reason: format!("expected BucketFull, got {other:?}"),
-                });
-            }
-        }
+            other @ (InsertOutcome::Added | InsertOutcome::Updated) => Err(Error::HostState {
+                reason: format!("expected BucketFull, got {other:?}"),
+            }),
+        }?;
         check(!bucket.contains(&id_for_byte(3)), || {
             "rejected peer must not be in the bucket".to_owned()
         })?;

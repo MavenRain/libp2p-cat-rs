@@ -29,7 +29,7 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | `libp2p-cat-identity`  | Ed25519 ↔ X25519 binding: `SignedStaticKey` payload (96 bytes) carried as the XX handshake trailer. |
 | `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop; verifies every peer's identity binding and surfaces the resolved `PeerId` on `HandshakeComplete`. |
 | `libp2p-cat-pubsub`    | `PubsubMux` over `Host`: kind-byte multiplexed app data + RLNC pubsub with source / decoder / relay roles. |
-| `libp2p-cat-kad`       | Kademlia DHT primitives: `NodeId`, XOR `Distance`, k-buckets, and a `RoutingTable`.  Pass 1 is offline (no wire); RPCs and iterative lookup land in pass 2. |
+| `libp2p-cat-kad`       | Kademlia DHT: `NodeId`, XOR `Distance`, k-buckets, `RoutingTable`, plus a `KademliaNode` driver over `Host` that auto-answers `PING` / `FIND_NODE` and auto-inserts observed peers.  Iterative lookup lands in pass 3. |
 | `libp2p-cat-rs`        | Top-level umbrella re-exporting all of the above.        |
 
 A runnable two-peer chat example lives at `examples/chat/`:
@@ -54,7 +54,7 @@ Future:
 
 | Piece                  | Purpose                                                  |
 | ---------------------- | -------------------------------------------------------- |
-| Kademlia DHT (passes 2-3) | Wire-side RPCs (PING / FIND_NODE) and iterative lookup over `Host`. |
+| Kademlia DHT (pass 3)  | Iterative lookup driver over the existing `KademliaNode`. |
 | NAT traversal          | Rendezvous-based UDP hole-punching.                      |
 
 ## Why UDP-only?

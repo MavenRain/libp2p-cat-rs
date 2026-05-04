@@ -1,10 +1,18 @@
 //! Kademlia DHT primitives for `libp2p-cat-rs`.
 //!
-//! This crate ships in passes; pass 1 (this crate version) covers
-//! only the offline data structures: a fixed-width [`NodeId`] derived
-//! from a [`PeerId`](libp2p_cat_types::PeerId), the XOR
-//! [`Distance`] metric, k-buckets, and a [`RoutingTable`] indexed by
-//! distance.  No wire, no RPCs, no lookup driver yet.
+//! Pass 1 shipped the offline data structures: a fixed-width
+//! [`NodeId`] derived from a [`PeerId`](libp2p_cat_types::PeerId),
+//! the XOR [`Distance`] metric, k-buckets, and a [`RoutingTable`]
+//! indexed by distance.
+//!
+//! Pass 2 (this version) adds the wire side: a single-byte-opcode
+//! [`Frame`] encoding for `PING` / `FIND_NODE` RPCs, and a
+//! [`KademliaNode`] driver wrapping a [`Host`](libp2p_cat_host::Host)
+//! that auto-answers inbound `PING` and `FIND_NODE` requests, auto-
+//! inserts observed peers into the routing table, and surfaces
+//! [`KadEvent`]s for the caller to consume.  Iterative lookup
+//! (driving the `FIND_NODE` results through successive rounds of
+//! queries) is deferred to pass 3.
 //!
 //! # Identifier choice
 //!
@@ -29,11 +37,17 @@
 #![forbid(unsafe_code)]
 
 mod bucket;
+mod codec;
 mod distance;
+mod event;
+mod node;
 mod node_id;
 mod routing_table;
 
 pub use bucket::{Bucket, DEFAULT_K, InsertOutcome};
+pub use codec::{ENTRY_V4_LEN, ENTRY_V6_LEN, Frame, MAX_PEERS_PER_RESP, Opcode, decode, encode};
 pub use distance::Distance;
+pub use event::KadEvent;
+pub use node::KademliaNode;
 pub use node_id::{NODE_ID_BITS, NODE_ID_LEN, NodeId};
 pub use routing_table::RoutingTable;
