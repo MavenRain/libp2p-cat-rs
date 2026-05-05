@@ -1,15 +1,25 @@
-//! End-to-end STUN-style address observation between two
-//! [`RendezvousNode`]s over real loopback UDP.
+//! End-to-end punch coordination via a rendezvous server.
 //!
-//! Alice plays client; the server peer parks in a daemon thread
-//! that runs `recv_one` indefinitely.  Alice handshakes with the
-//! server, calls `observe_self`, and asserts the returned address
-//! equals her own bind address.  On loopback this is the only way
-//! `observed` can possibly come out: the server sees alice's
-//! packets coming from her bind port, with the loopback IP.  The
-//! test verifies the wire round-trip; verifying actual NAT
-//! traversal requires real or simulated NAT and is out of scope
-//! for this crate's tests.
+//! Topology:
+//!
+//! ```text
+//!   alice <-> server <-> bob
+//! ```
+//!
+//! Alice and bob each handshake with the rendezvous server.  Server
+//! and bob then run as daemon-thread responders.  Alice calls
+//! `punch_via(server_addr, bob_addr)`.  The server's daemon decodes
+//! the inbound `PUNCH_REQ`, sees bob is established, and sends a
+//! `PUNCH_FORWARD { initiator: alice_addr }` to bob.  Bob's daemon
+//! decodes the forward and auto-fires a 1-byte bare-datagram punch
+//! at alice via [`Host::send_raw`](libp2p_cat_host::Host::send_raw).
+//! Alice's next `recv_one` surfaces a [`RendezvousEvent::Rejected`]
+//! event whose `addr` equals bob's address, confirming the punch
+//! landed.
+//!
+//! On loopback this verifies the wire protocol; in real deployment
+//! the punch's role is to open bob's NAT mapping for an inbound
+//! dial from alice.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread;
@@ -23,14 +33,6 @@ use libp2p_cat_udp::UdpTransport;
 
 fn loopback_v4() -> UdpAddr {
     UdpAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-}
-
-fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
-    if cond {
-        Ok(())
-    } else {
-        Err(Error::HostState { reason: reason() })
-    }
 }
 
 fn build_node(static_seed: u8, identity_seed: u8) -> Result<(RendezvousNode, UdpAddr), Error> {
@@ -104,9 +106,10 @@ fn spawn_responder(node: RendezvousNode, ephemeral_seed: [u8; 32]) {
 }
 
 #[test]
-fn observe_self_returns_clients_bind_address() -> Result<(), Error> {
+fn punch_via_forwards_and_target_punches_back() -> Result<(), Error> {
     let (alice, alice_addr) = build_node(0xA1, 0x11)?;
-    let (server, server_addr) = build_node(0xB2, 0x22)?;
+    let (bob, bob_addr) = build_node(0xB2, 0x22)?;
+    let (server, server_addr) = build_node(0xC3, 0x33)?;
 
     // alice <-> server
     let (alice, server) = handshake_pair(
@@ -117,17 +120,36 @@ fn observe_self_returns_clients_bind_address() -> Result<(), Error> {
         [0xE1; 32],
         [0xE2; 32],
     )?;
+    // bob <-> server (bob initiates, server responds)
+    let (bob, server) = handshake_pair(bob, server, bob_addr, server_addr, [0xE3; 32], [0xE4; 32])?;
 
-    // Park server in a daemon thread so it answers alice's
-    // OBSERVE_REQ in real time.
+    // Park server and bob in daemon threads so they auto-handle the
+    // PUNCH_REQ forward and the PUNCH_FORWARD bare-datagram emission
+    // in real time.
     spawn_responder(server, [0xF1; 32]);
+    spawn_responder(bob, [0xF2; 32]);
 
-    // Alice asks the server "what address do you see me coming from?"
-    // and the synchronous observe_self drains until the matching
-    // OBSERVE_RESP arrives.
-    let (_alice, observed) = alice.observe_self(server_addr, || [0u8; 32]).run()?;
+    // Alice asks the server to relay a punch request to bob.  The
+    // call is fire-and-forget; the actual punch lands on alice's
+    // socket when bob's daemon processes the forwarded request.
+    let alice = alice.punch_via(server_addr, bob_addr).run()?;
 
-    check(observed == alice_addr, || {
-        format!("observed address {observed} should equal alice's bind address {alice_addr}")
-    })
+    // Alice's next recv_one should surface a Rejected event for
+    // bob's bare-datagram punch (1 byte, not a 32-byte handshake
+    // msg1, so Host's try_responder_msg1 rejects it).
+    let (_alice, ev) = alice.recv_one([0; 32]).run()?;
+    match ev {
+        RendezvousEvent::Rejected { addr, .. } if addr == bob_addr => Ok(()),
+        other @ (RendezvousEvent::HandshakeProgress { .. }
+        | RendezvousEvent::HandshakeComplete { .. }
+        | RendezvousEvent::ObserveRequestReceived { .. }
+        | RendezvousEvent::ObserveResponseReceived { .. }
+        | RendezvousEvent::PunchRequestReceived { .. }
+        | RendezvousEvent::PunchForwardReceived { .. }
+        | RendezvousEvent::Rejected { .. }) => Err(Error::HostState {
+            reason: format!(
+                "expected Rejected event from bob ({bob_addr}) carrying the bare punch, got {other:?}"
+            ),
+        }),
+    }
 }

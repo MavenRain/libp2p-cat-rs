@@ -219,6 +219,40 @@ impl Host {
         })
     }
 
+    /// Send `bytes` to `addr` as a bare UDP datagram, bypassing the
+    /// Noise transport entirely.  Has no effect on connection state:
+    /// no handshake is started, no transport-state nonce advances,
+    /// no encryption happens.
+    ///
+    /// Intended for niche uses where the application needs to emit
+    /// a packet that the receiver will *not* interpret as a Noise
+    /// handshake or transport datagram, the canonical case being
+    /// rendezvous-style hole punching where a peer fires an
+    /// undersized "punch" datagram at a NAT to open the mapping
+    /// without starting a handshake.  Receivers see such datagrams
+    /// as [`HostEvent::Rejected`] (the dispatcher's
+    /// `try_responder_msg1` path rejects anything that is not a
+    /// `MESSAGE_1_LEN`-byte handshake).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] / [`Error::DatagramTooLarge`] from the socket.
+    #[must_use]
+    pub fn send_raw(self, addr: UdpAddr, bytes: Vec<u8>) -> Io<Error, Self> {
+        let Self {
+            socket,
+            identity,
+            handshakes,
+            established,
+        } = self;
+        socket.send(addr, bytes).map(move |socket| Self {
+            socket,
+            identity,
+            handshakes,
+            established,
+        })
+    }
+
     /// Receive one datagram and dispatch it.
     ///
     /// `ephemeral_seed` is consumed only if the inbound datagram is a

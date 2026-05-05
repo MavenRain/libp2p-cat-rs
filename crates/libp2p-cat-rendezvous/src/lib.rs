@@ -1,12 +1,16 @@
 //! Rendezvous primitives for `libp2p-cat-rs`.
 //!
-//! This crate ships in passes; pass 5 (this version) covers
-//! STUN-style address observation only.  A peer asks a publicly-
-//! reachable rendezvous what address its UDP packets appear to be
-//! coming from, useful as a foundation for NAT-aware peer discovery
-//! (full-cone NATs can advertise the observed address directly;
-//! restricted-cone and symmetric NATs need more, deferred to pass
-//! 6's `PUNCH` coordination).
+//! Pass 5 covered STUN-style address observation: a peer asks a
+//! publicly-reachable rendezvous what address its UDP packets
+//! appear to be coming from, useful for full-cone NAT advertisement.
+//!
+//! Pass 6 (this version) adds `PUNCH` coordination: a client peer
+//! asks the rendezvous to forward a punch request to a target peer;
+//! the target peer auto-fires a bare-datagram punch back at the
+//! initiator, opening a NAT mapping for the initiator's subsequent
+//! dial.  Restricted-cone and port-restricted NATs work end-to-end
+//! once the initiator dials; symmetric NATs still need a TURN-style
+//! relay, deferred indefinitely.
 //!
 //! # Roles
 //!

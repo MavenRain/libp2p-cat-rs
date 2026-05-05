@@ -17,8 +17,16 @@
 //! Opcodes (see [`Opcode`]):
 //!
 //! - [`Opcode::ObserveReq`] (`0x00`): 0-byte body.
-//! - [`Opcode::ObserveResp`] (`0x01`): 1-byte addr-kind + IPv4(4) /
-//!   IPv6(16) + 2-byte big-endian port.  7 bytes for V4, 19 for V6.
+//! - [`Opcode::ObserveResp`] (`0x01`): a `UdpAddr`-shaped body
+//!   (1-byte addr-kind + IPv4(4) / IPv6(16) + 2-byte BE port).
+//!   7 bytes for V4, 19 for V6.
+//! - [`Opcode::PunchReq`] (`0x02`): a `UdpAddr`-shaped body carrying
+//!   the target peer's address; the requester is asking the
+//!   recipient to relay a punch request to that target.
+//! - [`Opcode::PunchForward`] (`0x03`): a `UdpAddr`-shaped body
+//!   carrying the original initiator's address; the receiver should
+//!   fire a bare-datagram "punch" at that address to open its NAT
+//!   mapping.
 //!
 //! IPv6 `flowinfo` and `scope_id` fields are encoded as `0`; non-zero
 //! values supplied by the caller are dropped on the wire.
@@ -36,6 +44,13 @@ pub enum Opcode {
     ObserveReq,
     /// Recipient's reply, carrying the observed [`UdpAddr`].
     ObserveResp,
+    /// Caller is asking the recipient (a rendezvous server) to
+    /// relay a punch request to the carried target address.
+    PunchReq,
+    /// Server is forwarding a `PunchReq` to the carried initiator
+    /// address; the receiver should fire a punch datagram at that
+    /// initiator.
+    PunchForward,
 }
 
 impl Opcode {
@@ -45,6 +60,8 @@ impl Opcode {
         match self {
             Self::ObserveReq => 0x00,
             Self::ObserveResp => 0x01,
+            Self::PunchReq => 0x02,
+            Self::PunchForward => 0x03,
         }
     }
 
@@ -58,6 +75,8 @@ impl Opcode {
         match byte {
             0x00 => Ok(Self::ObserveReq),
             0x01 => Ok(Self::ObserveResp),
+            0x02 => Ok(Self::PunchReq),
+            0x03 => Ok(Self::PunchForward),
             n => Err(protocol_error(format!(
                 "unknown rendezvous opcode 0x{n:02x}"
             ))),
@@ -72,7 +91,25 @@ pub enum Frame {
     /// Empty-body request: "what address do you see me coming from?"
     ObserveReq,
     /// Reply carrying the address the responder observed.
-    ObserveResp { observed: UdpAddr },
+    ObserveResp {
+        /// The address the responder saw the inbound packet
+        /// coming from.
+        observed: UdpAddr,
+    },
+    /// Asks the recipient (a rendezvous server) to forward a punch
+    /// request to `target`.
+    PunchReq {
+        /// Address of the peer the requester wants to reach.
+        target: UdpAddr,
+    },
+    /// Server is forwarding a punch request that originated at
+    /// `initiator`.  The receiver should fire a bare punch datagram
+    /// at `initiator` to open its NAT mapping.
+    PunchForward {
+        /// Address of the peer that asked the server for the
+        /// punch.
+        initiator: UdpAddr,
+    },
 }
 
 const ADDR_KIND_V4: u8 = 0x04;
@@ -100,6 +137,12 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, Error> {
         Frame::ObserveReq => Ok(vec![Opcode::ObserveReq.to_byte()]),
         Frame::ObserveResp { observed } => Ok(core::iter::once(Opcode::ObserveResp.to_byte())
             .chain(encode_addr(observed))
+            .collect()),
+        Frame::PunchReq { target } => Ok(core::iter::once(Opcode::PunchReq.to_byte())
+            .chain(encode_addr(target))
+            .collect()),
+        Frame::PunchForward { initiator } => Ok(core::iter::once(Opcode::PunchForward.to_byte())
+            .chain(encode_addr(initiator))
             .collect()),
     }
 }
@@ -133,7 +176,11 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, Error> {
     let body = bytes.get(1..).unwrap_or(&[]);
     match opcode {
         Opcode::ObserveReq => decode_observe_req(body),
-        Opcode::ObserveResp => decode_observe_resp(body),
+        Opcode::ObserveResp => decode_addr_body(body, |observed| Frame::ObserveResp { observed }),
+        Opcode::PunchReq => decode_addr_body(body, |target| Frame::PunchReq { target }),
+        Opcode::PunchForward => {
+            decode_addr_body(body, |initiator| Frame::PunchForward { initiator })
+        }
     }
 }
 
@@ -148,14 +195,20 @@ fn decode_observe_req(body: &[u8]) -> Result<Frame, Error> {
     }
 }
 
-fn decode_observe_resp(body: &[u8]) -> Result<Frame, Error> {
-    let (observed, consumed) = decode_addr(body)?;
+/// Parse a body that consists of exactly one [`UdpAddr`] and wrap
+/// the result in a [`Frame`] via `wrap`.  Used for `OBSERVE_RESP`,
+/// `PUNCH_REQ`, and `PUNCH_FORWARD`.
+fn decode_addr_body<F>(body: &[u8], wrap: F) -> Result<Frame, Error>
+where
+    F: FnOnce(UdpAddr) -> Frame,
+{
+    let (addr, consumed) = decode_addr(body)?;
     let trailing = body.get(consumed..).unwrap_or(&[]);
     if trailing.is_empty() {
-        Ok(Frame::ObserveResp { observed })
+        Ok(wrap(addr))
     } else {
         Err(protocol_error(format!(
-            "ObserveResp has {} unexpected trailing bytes",
+            "addr-bearing frame has {} unexpected trailing bytes",
             trailing.len()
         )))
     }
@@ -301,22 +354,12 @@ mod tests {
 
     #[test]
     fn unknown_opcode_is_rejected() -> Result<(), Error> {
-        match decode(&[0xFF]) {
-            Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
-                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
-            }),
-        }
+        expect_protocol_rejection(decode(&[0xFF]))
     }
 
     #[test]
     fn observe_req_rejects_trailing_bytes() -> Result<(), Error> {
-        match decode(&[0x00, 0xAA]) {
-            Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
-                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
-            }),
-        }
+        expect_protocol_rejection(decode(&[0x00, 0xAA]))
     }
 
     #[test]
@@ -326,12 +369,7 @@ mod tests {
             .chain(core::iter::once(0x09u8))
             .chain([0u8; 6])
             .collect();
-        match decode(&bytes) {
-            Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
-                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
-            }),
-        }
+        expect_protocol_rejection(decode(&bytes))
     }
 
     #[test]
@@ -341,10 +379,77 @@ mod tests {
             .chain(core::iter::once(ADDR_KIND_V4))
             .chain([0u8; 5])
             .collect();
-        match decode(&bytes) {
+        expect_protocol_rejection(decode(&bytes))
+    }
+
+    #[test]
+    fn punch_req_round_trip() -> Result<(), Error> {
+        let target = UdpAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 7), 4242));
+        let frame = Frame::PunchReq { target };
+        let bytes = encode(&frame)?;
+        check(bytes.first() == Some(&0x02), || {
+            format!("expected PUNCH_REQ opcode 0x02, got {:?}", bytes.first())
+        })?;
+        let parsed = decode(&bytes)?;
+        check(parsed == frame, || format!("decode mismatch: {parsed:?}"))
+    }
+
+    #[test]
+    fn punch_forward_round_trip() -> Result<(), Error> {
+        let initiator = UdpAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9999, 0, 0));
+        let frame = Frame::PunchForward { initiator };
+        let bytes = encode(&frame)?;
+        check(bytes.first() == Some(&0x03), || {
+            format!(
+                "expected PUNCH_FORWARD opcode 0x03, got {:?}",
+                bytes.first()
+            )
+        })?;
+        let parsed = decode(&bytes)?;
+        check(parsed == frame, || format!("decode mismatch: {parsed:?}"))
+    }
+
+    #[test]
+    fn punch_req_rejects_truncated_addr() -> Result<(), Error> {
+        // opcode 0x02, V4 kind, only 5 trailing bytes (need 6).
+        let bytes: Vec<u8> = core::iter::once(0x02u8)
+            .chain(core::iter::once(ADDR_KIND_V4))
+            .chain([0u8; 5])
+            .collect();
+        expect_protocol_rejection(decode(&bytes))
+    }
+
+    #[test]
+    fn punch_forward_rejects_trailing_bytes() -> Result<(), Error> {
+        let initiator = UdpAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242));
+        let frame = Frame::PunchForward { initiator };
+        let bytes = encode(&frame)?;
+        let extended: Vec<u8> = bytes.into_iter().chain(core::iter::once(0xAAu8)).collect();
+        expect_protocol_rejection(decode(&extended))
+    }
+
+    /// Helper: assert that `outcome` is `Err(Error::PubsubProtocol)`,
+    /// enumerating every other `Error` variant and the `Ok` case
+    /// explicitly so a new variant cannot silently slip through.
+    fn expect_protocol_rejection(outcome: Result<Frame, Error>) -> Result<(), Error> {
+        match outcome {
             Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
+            Err(
+                other @ (Error::Io(_)
+                | Error::InvalidProtocolId { .. }
+                | Error::InvalidPeerId { .. }
+                | Error::DatagramTooLarge { .. }
+                | Error::NoiseDecrypt
+                | Error::NoiseProtocol { .. }
+                | Error::NoiseReplay { .. }
+                | Error::RlncLayer { .. }
+                | Error::HostState { .. }
+                | Error::IdentityVerify { .. }),
+            ) => Err(Error::HostState {
                 reason: format!("expected PubsubProtocol rejection, got {other:?}"),
+            }),
+            Ok(parsed) => Err(Error::HostState {
+                reason: format!("expected rejection, got Ok({parsed:?})"),
             }),
         }
     }

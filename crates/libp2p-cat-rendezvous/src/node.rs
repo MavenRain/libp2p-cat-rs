@@ -1,12 +1,14 @@
 //! [`RendezvousNode`]: a [`Host`] that auto-answers inbound
-//! `OBSERVE_REQ` frames and exposes a synchronous
-//! [`RendezvousNode::observe_self`] method to ask a remote
-//! rendezvous what address it sees this node coming from.
+//! rendezvous RPC frames and exposes synchronous client methods.
 //!
-//! Pass 5 keeps the surface deliberately thin: every node plays
-//! both client and server roles symmetrically, the way
-//! [`KademliaNode`](libp2p_cat_kad::KademliaNode) plays both PING
-//! roles.  Pass 6 will add `PUNCH` coordination on top of this.
+//! - [`RendezvousNode::observe_self`] (pass 5): ask a remote
+//!   rendezvous what address it sees this node coming from.
+//! - [`RendezvousNode::punch_via`] (pass 6): ask a remote
+//!   rendezvous to relay a punch request to a target peer.
+//!
+//! Every node plays both client and server roles symmetrically, the
+//! way [`KademliaNode`](libp2p_cat_kad::KademliaNode) plays both
+//! PING roles.
 
 use comp_cat_rs::effect::io::Io;
 
@@ -103,8 +105,39 @@ impl RendezvousNode {
             .flat_map(move |node| drain_for_observe_response(node, server_addr, seed_factory))
     }
 
-    /// Receive one event.  Inbound `OBSERVE_REQ`s are auto-answered
-    /// before the corresponding "received" variant is emitted.
+    /// Send a `PUNCH_REQ` to `server_addr` asking it to forward a
+    /// punch request to `target_addr`.  Fire-and-forget: the server
+    /// will (if it has a session with `target_addr`) send a
+    /// `PUNCH_FORWARD` to the target, which then auto-fires a bare
+    /// punch datagram at us.  The caller's next [`Self::recv_one`]
+    /// will surface the resulting [`RendezvousEvent::Rejected`]
+    /// event when the punch lands.
+    ///
+    /// On loopback this verifies the wire protocol; in real
+    /// deployment behind NATs the act of being punched (and our
+    /// subsequent dial of `target_addr`) is what threads the
+    /// connection through both NATs' mappings.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::HostState`] if `server_addr` is not yet
+    ///   established.
+    /// - Underlying socket / Noise errors propagate transparently.
+    #[must_use]
+    pub fn punch_via(self, server_addr: UdpAddr, target_addr: UdpAddr) -> Io<Error, Self> {
+        let frame = Frame::PunchReq {
+            target: target_addr,
+        };
+        let Self { host } = self;
+        Io::suspend(move || encode(&frame))
+            .flat_map(move |bytes| host.send(server_addr, bytes).map(move |host| Self { host }))
+    }
+
+    /// Receive one event.  Inbound `OBSERVE_REQ`s are auto-answered,
+    /// inbound `PUNCH_REQ`s are auto-forwarded (when the target is
+    /// established), and inbound `PUNCH_FORWARD`s auto-fire a bare
+    /// punch datagram at the original initiator, all *before* the
+    /// corresponding "received" variant is emitted.
     ///
     /// # Errors
     ///
@@ -144,6 +177,8 @@ where
         | RendezvousEvent::HandshakeComplete { .. }
         | RendezvousEvent::ObserveRequestReceived { .. }
         | RendezvousEvent::ObserveResponseReceived { .. }
+        | RendezvousEvent::PunchRequestReceived { .. }
+        | RendezvousEvent::PunchForwardReceived { .. }
         | RendezvousEvent::Rejected { .. } => {
             drain_for_observe_response(node, server_addr, factory_for_recurse)
         }
@@ -182,7 +217,19 @@ fn handle_datagram(
     plaintext: &[u8],
 ) -> Io<Error, (RendezvousNode, RendezvousEvent)> {
     match decode(plaintext) {
-        Err(e) => Io::pure((
+        Err(
+            e @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseDecrypt
+            | Error::NoiseProtocol { .. }
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
+        ) => Io::pure((
             RendezvousNode { host },
             RendezvousEvent::Rejected {
                 addr,
@@ -197,6 +244,8 @@ fn handle_datagram(
                 observed,
             },
         )),
+        Ok(Frame::PunchReq { target }) => auto_forward_punch(host, addr, target),
+        Ok(Frame::PunchForward { initiator }) => auto_send_punch(host, addr, initiator),
     }
 }
 
@@ -211,3 +260,64 @@ fn auto_reply_observe(host: Host, addr: UdpAddr) -> Io<Error, (RendezvousNode, R
         })
     })
 }
+
+/// Server-side: relay an inbound `PUNCH_REQ` to `target` if we
+/// have an established session with it.  Surfaces a
+/// [`RendezvousEvent::PunchRequestReceived`] either way.
+fn auto_forward_punch(
+    host: Host,
+    from: UdpAddr,
+    target: UdpAddr,
+) -> Io<Error, (RendezvousNode, RendezvousEvent)> {
+    if host.is_established(target) {
+        let frame = Frame::PunchForward { initiator: from };
+        Io::suspend(move || encode(&frame)).flat_map(move |bytes| {
+            host.send(target, bytes).map(move |host| {
+                (
+                    RendezvousNode { host },
+                    RendezvousEvent::PunchRequestReceived {
+                        from,
+                        target,
+                        forwarded: true,
+                    },
+                )
+            })
+        })
+    } else {
+        Io::pure((
+            RendezvousNode { host },
+            RendezvousEvent::PunchRequestReceived {
+                from,
+                target,
+                forwarded: false,
+            },
+        ))
+    }
+}
+
+/// Client-side: fire a 1-byte bare UDP datagram at `initiator`
+/// using [`Host::send_raw`].  The deliberately undersized payload
+/// ensures the receiver's `try_responder_msg1` rejects it without
+/// starting a half-handshake; the only side-effect we want is the
+/// NAT mapping our outbound packet creates.
+fn auto_send_punch(
+    host: Host,
+    from: UdpAddr,
+    initiator: UdpAddr,
+) -> Io<Error, (RendezvousNode, RendezvousEvent)> {
+    host.send_raw(initiator, vec![PUNCH_BYTE]).map(move |host| {
+        (
+            RendezvousNode { host },
+            RendezvousEvent::PunchForwardReceived { from, initiator },
+        )
+    })
+}
+
+/// The bare byte we send as a punch.  Any single byte works; we use
+/// `0x00` as a stable marker.  Receivers see this as a malformed
+/// datagram (length 1, not [`MESSAGE_1_LEN`]) and surface
+/// [`HostEvent::Rejected`].
+///
+/// [`MESSAGE_1_LEN`]: libp2p_cat_noise::MESSAGE_1_LEN
+/// [`HostEvent::Rejected`]: libp2p_cat_host::HostEvent::Rejected
+const PUNCH_BYTE: u8 = 0x00;

@@ -52,6 +52,32 @@ pub enum RendezvousEvent {
         observed: UdpAddr,
     },
 
+    /// A peer (acting as a client) asked us (acting as a rendezvous
+    /// server) to relay a punch request to `target`.  If
+    /// `forwarded` is true we sent the corresponding `PUNCH_FORWARD`
+    /// to `target` over an established session; otherwise `target`
+    /// was not established and the request was dropped.
+    PunchRequestReceived {
+        /// Address of the peer that asked.
+        from: UdpAddr,
+        /// Address of the peer the requester wants to reach.
+        target: UdpAddr,
+        /// Whether the server actually forwarded the request.
+        forwarded: bool,
+    },
+
+    /// A rendezvous server forwarded a punch request originating at
+    /// `initiator`.  We have already fired a 1-byte bare-datagram
+    /// punch at `initiator` to open our NAT mapping; this event is
+    /// purely informational.
+    PunchForwardReceived {
+        /// Address of the rendezvous server that forwarded the
+        /// request.
+        from: UdpAddr,
+        /// Address of the peer that originated the punch request.
+        initiator: UdpAddr,
+    },
+
     /// An inbound datagram was rejected.  Per-peer issues (decrypt
     /// failure, malformed handshake, malformed RPC) surface as this
     /// event rather than as `Result::Err`, so a long-running event
