@@ -46,8 +46,22 @@
 //! Registering both decoder and recoder for the same topic on the
 //! same node is currently undefined; the second registration
 //! replaces the first.
+//!
+//! # Mux composability (pass 8)
+//!
+//! [`PubsubMux::split`] and [`PubsubMux::join`] expose the "joined" /
+//! "decomposed" views of the mux so a multi-protocol mux can hold
+//! the underlying [`Host`] alongside other protocols' state and
+//! reconstitute a transient `PubsubMux` for each pubsub-kinded
+//! inbound plaintext.  The protocol state lives in [`PubsubState`].
+//!
+//! [`PubsubMux::process_plaintext`] performs the protocol-level
+//! reaction to a single freshly-decrypted plaintext datagram, with
+//! no socket-level dispatch.  Standalone deployments go through
+//! [`PubsubMux::recv_one`], which reads one datagram from the socket,
+//! surfaces handshake-shaped events directly, and routes
+//! [`HostEvent::DatagramDelivered`] through `process_plaintext`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use comp_cat_rs::effect::io::Io;
@@ -56,13 +70,12 @@ use libp2p_cat_host::{Host, HostEvent};
 use libp2p_cat_noise::StaticPublicKey;
 use libp2p_cat_types::{Error, PeerId, UdpAddr};
 
-use rlnc_cat_rs::coding::decode::DecoderState;
 use rlnc_cat_rs::coding::piece::{CodedPiece, OriginalData};
-use rlnc_cat_rs::coding::recode::Recoder;
 use rlnc_cat_rs::gossip::{WirePiece, source};
 
 use crate::auth::PubsubAuth;
 use crate::codec;
+use crate::state::PubsubState;
 use crate::topic::Topic;
 
 /// Plaintext discriminator for raw application data.
@@ -148,8 +161,9 @@ pub enum MuxEvent {
     },
 }
 
-/// A [`Host`] paired with per-topic decoder and recoder state, an
-/// authenticator, and a kind-byte-tagged plaintext envelope.
+/// A [`Host`] paired with [`PubsubState<A>`] (per-topic decoder /
+/// recoder maps and the authenticator) and a kind-byte-tagged
+/// plaintext envelope.
 ///
 /// Generic over [`PubsubAuth`]; choose
 /// [`rlnc_cat_rs::auth::NullAuthenticator`] when no per-frame
@@ -165,9 +179,7 @@ where
     A::Tag: Clone + Send + Sync + 'static,
 {
     host: Host,
-    auth: Arc<A>,
-    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
-    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
+    state: PubsubState<A>,
 }
 
 impl<A> PubsubMux<A>
@@ -181,15 +193,37 @@ where
     pub fn new(host: Host, auth: Arc<A>) -> Self {
         Self {
             host,
-            auth,
-            decoders: BTreeMap::new(),
-            recoders: BTreeMap::new(),
+            state: PubsubState::new(auth),
         }
+    }
+
+    /// Decompose this mux into its underlying [`Host`] and protocol
+    /// state.  Pubsub's protocol state is the [`PubsubState<A>`]
+    /// triple of authenticator, decoder map, and recoder map.
+    ///
+    /// Used by the multi-protocol mux to share a single [`Host`]
+    /// across protocols: the mux holds the [`Host`] alongside other
+    /// protocols' state and reconstitutes a transient [`PubsubMux`]
+    /// via [`Self::join`] for each pubsub-kinded inbound plaintext.
+    pub fn split(self) -> (Host, PubsubState<A>) {
+        let Self { host, state } = self;
+        (host, state)
+    }
+
+    /// Inverse of [`Self::split`]: build a mux from a [`Host`] and a
+    /// pre-existing [`PubsubState<A>`].
+    pub fn join(host: Host, state: PubsubState<A>) -> Self {
+        Self { host, state }
     }
 
     /// Borrow the underlying host (read-only).
     pub fn host(&self) -> &Host {
         &self.host
+    }
+
+    /// Borrow the underlying protocol state (read-only).
+    pub fn state(&self) -> &PubsubState<A> {
+        &self.state
     }
 
     /// Consume the mux and return its host, dropping pubsub state.
@@ -202,7 +236,7 @@ where
     /// broadcasting.
     #[must_use]
     pub fn commit(&self, original: &OriginalData) -> A::Commitment {
-        self.auth.commit(original)
+        self.state.commit(original)
     }
 
     /// Local UDP address.
@@ -228,18 +262,9 @@ where
     /// Propagates [`Host::dial`] errors.
     #[must_use]
     pub fn dial(self, addr: UdpAddr, ephemeral_seed: [u8; 32]) -> Io<Error, Self> {
-        let Self {
-            host,
-            auth,
-            decoders,
-            recoders,
-        } = self;
-        host.dial(addr, ephemeral_seed).map(move |host| Self {
-            host,
-            auth,
-            decoders,
-            recoders,
-        })
+        let Self { host, state } = self;
+        host.dial(addr, ephemeral_seed)
+            .map(move |host| Self { host, state })
     }
 
     /// Pre-register a topic for the **decoder** role: inbound pubsub
@@ -252,21 +277,10 @@ where
         piece_byte_len: usize,
         commitment: A::Commitment,
     ) -> Self {
-        let Self {
-            host,
-            auth,
-            mut decoders,
-            recoders,
-        } = self;
-        decoders.insert(
-            topic,
-            (DecoderState::new(piece_count, piece_byte_len), commitment),
-        );
+        let Self { host, state } = self;
         Self {
             host,
-            auth,
-            decoders,
-            recoders,
+            state: state.register_topic(topic, piece_count, piece_byte_len, commitment),
         }
     }
 
@@ -282,21 +296,10 @@ where
         piece_byte_len: usize,
         commitment: A::Commitment,
     ) -> Self {
-        let Self {
-            host,
-            auth,
-            decoders,
-            mut recoders,
-        } = self;
-        recoders.insert(
-            topic,
-            (Recoder::new(piece_count, piece_byte_len), commitment),
-        );
+        let Self { host, state } = self;
         Self {
             host,
-            auth,
-            decoders,
-            recoders,
+            state: state.register_relay(topic, piece_count, piece_byte_len, commitment),
         }
     }
 
@@ -309,19 +312,10 @@ where
     /// Propagates [`Host::send`] errors.
     #[must_use]
     pub fn send_app(self, addr: UdpAddr, payload: &[u8]) -> Io<Error, Self> {
-        let Self {
-            host,
-            auth,
-            decoders,
-            recoders,
-        } = self;
+        let Self { host, state } = self;
         let framed = prefix_kind(KIND_APP, payload);
-        host.send(addr, framed).map(move |host| Self {
-            host,
-            auth,
-            decoders,
-            recoders,
-        })
+        host.send(addr, framed)
+            .map(move |host| Self { host, state })
     }
 
     /// Broadcast `data` on `topic` to every established peer as
@@ -361,7 +355,7 @@ where
     {
         let piece_count = data.piece_count();
         let piece_byte_len = data.piece_byte_len();
-        let auth_for_source = Arc::clone(&self.auth);
+        let auth_for_source = Arc::clone(&self.state.auth);
         let (commitment, stream) = source(auth_for_source, data, rng_factory);
         stream
             .take(num_pieces)
@@ -392,6 +386,12 @@ where
     /// recoded piece's coding vector.  Pure decoder / sender nodes
     /// can pass [`unused_relay_rng`].
     ///
+    /// Internally factored as `host.recv_one` (which surfaces
+    /// handshake-shaped events directly) followed by
+    /// [`Self::process_plaintext`] on the
+    /// [`HostEvent::DatagramDelivered`] arm; the multi-protocol mux
+    /// reuses the latter directly.
+    ///
     /// [`register_relay`]: PubsubMux::register_relay
     ///
     /// # Errors
@@ -404,16 +404,40 @@ where
     where
         R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
     {
-        let Self {
-            host,
-            auth,
-            decoders,
-            recoders,
-        } = self;
+        let Self { host, state } = self;
         host.recv_one(ephemeral_seed)
-            .flat_map(move |(host, host_event)| {
-                process_event(host, auth, decoders, recoders, host_event, relay_rng)
-            })
+            .flat_map(move |(host, host_event)| process_event(host, state, host_event, relay_rng))
+    }
+
+    /// React to a single freshly-decrypted plaintext datagram from
+    /// `addr`.  Performs only protocol-level work: peeling the kind
+    /// byte and routing to either [`MuxEvent::AppData`] or the
+    /// pubsub-frame verify-and-dispatch path.  Socket-level
+    /// dispatch (handshake progress, decrypt failure, etc.) happens
+    /// in [`Self::recv_one`] before this method is called.
+    ///
+    /// `plaintext` includes the standalone-mode kind byte (`KIND_APP`
+    /// or `KIND_PUBSUB`).  The multi-protocol mux peels its own
+    /// outer kind byte separately and passes the inner pubsub frame
+    /// through a different entry point.
+    ///
+    /// # Errors
+    ///
+    /// Underlying socket failures from relay fan-out propagate as
+    /// `Err`; malformed frames and tag-verify failures surface as
+    /// [`MuxEvent::Rejected`].
+    #[must_use]
+    pub fn process_plaintext<R>(
+        self,
+        addr: UdpAddr,
+        plaintext: &[u8],
+        relay_rng: R,
+    ) -> Io<Error, (Self, MuxEvent)>
+    where
+        R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
+    {
+        let Self { host, state } = self;
+        dispatch_plaintext(host, state, addr, plaintext, relay_rng)
     }
 }
 
@@ -458,18 +482,9 @@ where
     addrs.into_iter().fold(Io::pure(mux), |acc, addr| {
         let datagram = prefix_kind(KIND_PUBSUB, frame);
         acc.flat_map(move |mux| {
-            let PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            } = mux;
-            host.send(addr, datagram).map(move |host| PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            })
+            let PubsubMux { host, state } = mux;
+            host.send(addr, datagram)
+                .map(move |host| PubsubMux { host, state })
         })
     })
 }
@@ -496,18 +511,9 @@ where
     let mux_io = addrs.into_iter().fold(Io::pure(mux), |acc, addr| {
         let datagram = prefix_kind(KIND_PUBSUB, frame);
         acc.flat_map(move |mux| {
-            let PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            } = mux;
-            host.send(addr, datagram).map(move |host| PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            })
+            let PubsubMux { host, state } = mux;
+            host.send(addr, datagram)
+                .map(move |host| PubsubMux { host, state })
         })
     });
     mux_io.map(move |mux| (mux, count))
@@ -516,9 +522,7 @@ where
 /// Process one [`HostEvent`] through the mux's bookkeeping.
 fn process_event<A, R>(
     host: Host,
-    auth: Arc<A>,
-    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
-    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
+    state: PubsubState<A>,
     ev: HostEvent,
     relay_rng: R,
 ) -> Io<Error, (PubsubMux<A>, MuxEvent)>
@@ -530,12 +534,7 @@ where
 {
     match ev {
         HostEvent::HandshakeProgress { addr } => Io::pure((
-            PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            },
+            PubsubMux { host, state },
             MuxEvent::HandshakeProgress { addr },
         )),
         HostEvent::HandshakeComplete {
@@ -543,12 +542,7 @@ where
             remote_static,
             remote_peer_id,
         } => Io::pure((
-            PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            },
+            PubsubMux { host, state },
             MuxEvent::HandshakeComplete {
                 addr,
                 remote_static,
@@ -556,25 +550,18 @@ where
             },
         )),
         HostEvent::Rejected { addr, reason } => Io::pure((
-            PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            },
+            PubsubMux { host, state },
             MuxEvent::Rejected { addr, reason },
         )),
         HostEvent::DatagramDelivered { addr, plaintext } => {
-            dispatch_plaintext(host, auth, decoders, recoders, addr, &plaintext, relay_rng)
+            dispatch_plaintext(host, state, addr, &plaintext, relay_rng)
         }
     }
 }
 
 fn dispatch_plaintext<A, R>(
     host: Host,
-    auth: Arc<A>,
-    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
-    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
+    state: PubsubState<A>,
     addr: UdpAddr,
     plaintext: &[u8],
     relay_rng: R,
@@ -589,27 +576,14 @@ where
     match () {
         () if kind == Some(KIND_APP) => {
             let bytes = plaintext.get(1..).map(<[u8]>::to_vec).unwrap_or_default();
-            Io::pure((
-                PubsubMux {
-                    host,
-                    auth,
-                    decoders,
-                    recoders,
-                },
-                MuxEvent::AppData { addr, bytes },
-            ))
+            Io::pure((PubsubMux { host, state }, MuxEvent::AppData { addr, bytes }))
         }
         () if kind == Some(KIND_PUBSUB) => {
             let body = plaintext.get(1..).unwrap_or(&[]);
-            handle_pubsub_body(host, auth, decoders, recoders, addr, body, relay_rng)
+            handle_pubsub_body(host, state, addr, body, relay_rng)
         }
         () if kind.is_none() => Io::pure((
-            PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            },
+            PubsubMux { host, state },
             MuxEvent::Rejected {
                 addr,
                 reason: "datagram plaintext was empty (no kind byte)".to_owned(),
@@ -618,12 +592,7 @@ where
         () => {
             let unknown = kind.unwrap_or(0);
             Io::pure((
-                PubsubMux {
-                    host,
-                    auth,
-                    decoders,
-                    recoders,
-                },
+                PubsubMux { host, state },
                 MuxEvent::Rejected {
                     addr,
                     reason: format!("unknown plaintext kind byte 0x{unknown:02x}"),
@@ -635,9 +604,7 @@ where
 
 fn handle_pubsub_body<A, R>(
     host: Host,
-    auth: Arc<A>,
-    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
-    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
+    state: PubsubState<A>,
     addr: UdpAddr,
     body: &[u8],
     relay_rng: R,
@@ -651,12 +618,7 @@ where
     let parsed = codec::decode::<A>(body);
     match parsed {
         Err(e) => Io::pure((
-            PubsubMux {
-                host,
-                auth,
-                decoders,
-                recoders,
-            },
+            PubsubMux { host, state },
             MuxEvent::Rejected {
                 addr,
                 reason: format!("pubsub frame decode failed: {e}"),
@@ -666,35 +628,13 @@ where
             let topic = frame.topic.clone();
             // Relay role takes precedence over decoder role when both
             // are registered (last-write-wins is the documented policy).
-            if recoders.contains_key(&topic) {
-                relay_path(
-                    host,
-                    auth,
-                    decoders,
-                    recoders,
-                    addr,
-                    topic,
-                    &wire_piece,
-                    relay_rng,
-                )
-            } else if decoders.contains_key(&topic) {
-                Io::pure(decoder_path(
-                    host,
-                    auth,
-                    decoders,
-                    recoders,
-                    addr,
-                    topic,
-                    &wire_piece,
-                ))
+            if state.recoders.contains_key(&topic) {
+                relay_path(host, state, addr, topic, &wire_piece, relay_rng)
+            } else if state.decoders.contains_key(&topic) {
+                Io::pure(decoder_path(host, state, addr, topic, &wire_piece))
             } else {
                 Io::pure((
-                    PubsubMux {
-                        host,
-                        auth,
-                        decoders,
-                        recoders,
-                    },
+                    PubsubMux { host, state },
                     MuxEvent::Rejected {
                         addr,
                         reason: format!("frame received for unregistered topic {topic}"),
@@ -707,9 +647,7 @@ where
 
 fn decoder_path<A>(
     host: Host,
-    auth: Arc<A>,
-    mut decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
-    recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
+    state: PubsubState<A>,
     addr: UdpAddr,
     topic: Topic,
     wire_piece: &WirePiece<A>,
@@ -719,13 +657,20 @@ where
     A::Commitment: Clone + Send + Sync + 'static,
     A::Tag: Clone + Send + Sync + 'static,
 {
+    let PubsubState {
+        auth,
+        mut decoders,
+        recoders,
+    } = state;
     match decoders.remove(&topic) {
         None => (
             PubsubMux {
                 host,
-                auth,
-                decoders,
-                recoders,
+                state: PubsubState {
+                    auth,
+                    decoders,
+                    recoders,
+                },
             },
             MuxEvent::Rejected {
                 addr,
@@ -740,9 +685,11 @@ where
                     (
                         PubsubMux {
                             host,
-                            auth,
-                            decoders,
-                            recoders,
+                            state: PubsubState {
+                                auth,
+                                decoders,
+                                recoders,
+                            },
                         },
                         MuxEvent::Rejected {
                             addr,
@@ -754,9 +701,11 @@ where
                     Err(e) => (
                         PubsubMux {
                             host,
-                            auth,
-                            decoders,
-                            recoders,
+                            state: PubsubState {
+                                auth,
+                                decoders,
+                                recoders,
+                            },
                         },
                         MuxEvent::Rejected {
                             addr,
@@ -767,18 +716,22 @@ where
                         Ok(data) => (
                             PubsubMux {
                                 host,
-                                auth,
-                                decoders,
-                                recoders,
+                                state: PubsubState {
+                                    auth,
+                                    decoders,
+                                    recoders,
+                                },
                             },
                             MuxEvent::PubsubDelivered { addr, topic, data },
                         ),
                         Err(e) => (
                             PubsubMux {
                                 host,
-                                auth,
-                                decoders,
-                                recoders,
+                                state: PubsubState {
+                                    auth,
+                                    decoders,
+                                    recoders,
+                                },
                             },
                             MuxEvent::Rejected {
                                 addr,
@@ -791,9 +744,11 @@ where
                         (
                             PubsubMux {
                                 host,
-                                auth,
-                                decoders,
-                                recoders,
+                                state: PubsubState {
+                                    auth,
+                                    decoders,
+                                    recoders,
+                                },
                             },
                             MuxEvent::PubsubAbsorbed { addr, topic },
                         )
@@ -804,12 +759,10 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn relay_path<A, R>(
     host: Host,
-    auth: Arc<A>,
-    decoders: BTreeMap<Topic, (DecoderState, A::Commitment)>,
-    mut recoders: BTreeMap<Topic, (Recoder, A::Commitment)>,
+    state: PubsubState<A>,
     addr: UdpAddr,
     topic: Topic,
     wire_piece: &WirePiece<A>,
@@ -821,13 +774,20 @@ where
     A::Tag: Clone + Send + Sync + 'static,
     R: FnOnce(usize) -> Result<Vec<u8>, rlnc_cat_rs::error::Error> + Send + 'static,
 {
+    let PubsubState {
+        auth,
+        decoders,
+        mut recoders,
+    } = state;
     match recoders.remove(&topic) {
         None => Io::pure((
             PubsubMux {
                 host,
-                auth,
-                decoders,
-                recoders,
+                state: PubsubState {
+                    auth,
+                    decoders,
+                    recoders,
+                },
             },
             MuxEvent::Rejected {
                 addr,
@@ -842,9 +802,11 @@ where
                     Io::pure((
                         PubsubMux {
                             host,
-                            auth,
-                            decoders,
-                            recoders,
+                            state: PubsubState {
+                                auth,
+                                decoders,
+                                recoders,
+                            },
                         },
                         MuxEvent::Rejected {
                             addr,
@@ -856,9 +818,11 @@ where
                     Err(e) => Io::pure((
                         PubsubMux {
                             host,
-                            auth,
-                            decoders,
-                            recoders,
+                            state: PubsubState {
+                                auth,
+                                decoders,
+                                recoders,
+                            },
                         },
                         MuxEvent::Rejected {
                             addr,
@@ -887,9 +851,11 @@ where
                                 Io::suspend(move || frame_result).flat_map(move |frame| {
                                     let mux = PubsubMux {
                                         host,
-                                        auth,
-                                        decoders,
-                                        recoders,
+                                        state: PubsubState {
+                                            auth,
+                                            decoders,
+                                            recoders,
+                                        },
                                     };
                                     send_frame_excluding(mux, &frame, addr).map(
                                         move |(mux, fanout_count)| {

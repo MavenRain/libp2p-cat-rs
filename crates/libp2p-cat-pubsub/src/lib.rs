@@ -58,9 +58,11 @@
 mod auth;
 mod codec;
 mod mux;
+mod state;
 mod topic;
 
 pub use auth::{PubsubAuth, WireAuthenticator};
 pub use codec::{MAX_TOPIC_LEN, PubsubFrame, decode, encode};
 pub use mux::{KIND_APP, KIND_PUBSUB, MuxEvent, PubsubMux, unused_relay_rng};
+pub use state::PubsubState;
 pub use topic::Topic;

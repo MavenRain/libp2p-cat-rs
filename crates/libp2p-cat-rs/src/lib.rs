@@ -71,7 +71,7 @@ pub use libp2p_cat_noise::{
     TRANSPORT_OVERHEAD, TransportState,
 };
 pub use libp2p_cat_pubsub::{
-    KIND_APP, KIND_PUBSUB, MAX_TOPIC_LEN, MuxEvent, PubsubFrame, PubsubMux, Topic,
+    KIND_APP, KIND_PUBSUB, MAX_TOPIC_LEN, MuxEvent, PubsubFrame, PubsubMux, PubsubState, Topic,
     decode as decode_pubsub_frame, encode as encode_pubsub_frame, unused_relay_rng,
 };
 pub use libp2p_cat_rendezvous::{
