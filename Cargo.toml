@@ -11,6 +11,7 @@ members = [
     "crates/libp2p-cat-rendezvous",
     "crates/libp2p-cat-rs",
     "examples/chat",
+    "examples/rendezvous-demo",
 ]
 
 [workspace.package]

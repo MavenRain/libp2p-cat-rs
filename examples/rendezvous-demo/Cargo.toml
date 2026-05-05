@@ -1,0 +1,25 @@
+[package]
+name = "libp2p-cat-rs-example-rendezvous"
+description = "Two-binary demo of libp2p-cat-rendezvous: a long-running server that observes peer addresses and a one-shot client that prints what the server sees."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "rendezvous-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "rendezvous-observe"
+path = "src/bin/observe.rs"
+
+[dependencies]
+libp2p-cat-rs = { workspace = true }
+getrandom = { workspace = true }
+
+[lints]
+workspace = true
