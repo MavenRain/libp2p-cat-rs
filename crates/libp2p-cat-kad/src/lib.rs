@@ -12,14 +12,16 @@
 //! observed peers into the routing table, and surfaces [`KadEvent`]s
 //! for the caller to consume.
 //!
-//! Pass 3 (this version) adds [`KademliaNode::lookup_node`], a
-//! synchronous iterative `FIND_NODE` lookup that runs to completion
-//! and returns up to `k` peers closest to a target.  See
-//! [`LookupConfig`] and the [`lookup`] module for
-//! tunables and v1 limitations (in particular, the lookup only
-//! queries peers with an active established Host connection; pass 4
-//! will fold transparent dialing of newly-discovered peers into the
-//! lookup itself).
+//! Pass 3 added [`KademliaNode::lookup_node`], a synchronous
+//! iterative `FIND_NODE` lookup that runs to completion and returns
+//! up to `k` peers closest to a target.
+//!
+//! Pass 4 (this version) folds transparent dialing into the lookup:
+//! when the driver picks a peer that has no established Host
+//! connection, it sends Noise XX `msg1`, drains the resulting
+//! `HandshakeComplete` event in the same round's budget, and queries
+//! the peer on the next round.  See [`LookupConfig`] and the
+//! [`lookup`] module for tunables.
 //!
 //! # Identifier choice
 //!
@@ -34,10 +36,10 @@
 //!
 //! 256 buckets of capacity `k` (default [`DEFAULT_K`] = 20).  A peer
 //! `p` lives in bucket `i` where `i` is the position of the highest
-//! 1-bit in `distance(self, p)` (0-indexed from the LSB).  Pass 2
-//! will hook a wire-side ping under the bucket-full eviction policy;
-//! pass 1's [`Bucket::insert`] just reports
-//! [`InsertOutcome::BucketFull`] and lets the caller decide.
+//! 1-bit in `distance(self, p)` (0-indexed from the LSB).  When a
+//! bucket is full, [`Bucket::insert`] reports
+//! [`InsertOutcome::BucketFull`] with the LRU candidate and lets the
+//! caller decide whether to ping-and-evict or drop the new peer.
 //!
 //! [`PeerId`]: libp2p_cat_types::PeerId
 

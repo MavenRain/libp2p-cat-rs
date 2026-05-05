@@ -6,24 +6,28 @@
 //!   alice <-> bob <-> carol <-> dave
 //! ```
 //!
-//! Each peer in this chain has shaken hands only with its immediate
-//! neighbour(s).  Alice asks her local node to
-//! `lookup_node(target = dave's NodeId)`.
+//! Each peer has shaken hands only with its immediate neighbour(s).
+//! Alice asks her local node to `lookup_node(target = dave's NodeId)`.
 //!
-//! Pass 3's lookup queries only peers with an established connection,
-//! so:
+//! Pass 4's lookup transparently dials newly-discovered peers, so:
 //!
 //! 1. Round 1: alice queries bob (her only established peer).  Bob's
-//!    response advertises both of his neighbours, so alice's
-//!    shortlist gains carol.  Carol is not established with alice,
-//!    so the lookup tags her [`LookupStatus::Skipped`].
-//! 2. The lookup terminates.  Result includes bob and carol.  Dave
-//!    is **not** in the result because alice has no way to reach
-//!    anyone who shook hands with him.
+//!    response advertises both of his neighbours (alice and carol);
+//!    alice's shortlist gains carol.
+//! 2. Round 2: alice transparently dials carol.  Carol completes
+//!    the handshake and responds.
+//! 3. Round 3: alice queries carol (now established).  Carol's
+//!    response advertises bob and dave; alice's shortlist gains
+//!    dave.
+//! 4. Round 4: alice transparently dials dave.  Dave completes the
+//!    handshake.
+//! 5. Round 5: alice queries dave.  Dave's response advertises
+//!    carol; the lookup terminates with the top-`k` shortlist
+//!    containing bob, carol, and dave.
 //!
-//! Pass 4 will fold transparent dialing into the lookup; until then
-//! the integration test verifies the v1 semantics: alice learns
-//! carol's address and could dial her in a follow-up.
+//! Each peer in the chain runs in a daemon thread driving its own
+//! `recv_one` loop so all the cross-peer messages are processed in
+//! real time.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::thread;
@@ -108,17 +112,19 @@ fn handshake_pair(
 /// `node.recv_one` for an effectively-infinite number of iterations.
 /// No join handle is returned: the thread blocks on the UDP socket
 /// on its final iteration, and the OS reaps it when the test
-/// process exits.  This keeps the test shape simple at the cost of a
-/// single leaked thread per `lookup_walks_the_known_subgraph`
-/// invocation.
+/// process exits.
 ///
 /// `usize::MAX` is used as the iteration cap so a fold can thread
 /// `node` linearly without a `let mut` binding; on a 64-bit host the
 /// cap is `2^64`, comfortably beyond any test's actual recv count.
-fn spawn_responder(node: KademliaNode) {
+///
+/// Each daemon uses a distinct ephemeral seed so its `recv_one`
+/// calls are deterministic and don't collide with peers' seeds when
+/// a transparent dial brings them online for the first time.
+fn spawn_responder(node: KademliaNode, ephemeral_seed: [u8; 32]) {
     thread::spawn(move || -> Result<(), Error> {
         let _final = (0..usize::MAX).try_fold(node, |acc, _| {
-            let (next, _ev) = acc.recv_one([0; 32]).run()?;
+            let (next, _ev) = acc.recv_one(ephemeral_seed).run()?;
             Ok::<_, Error>(next)
         })?;
         Ok(())
@@ -126,7 +132,7 @@ fn spawn_responder(node: KademliaNode) {
 }
 
 #[test]
-fn lookup_walks_the_known_subgraph() -> Result<(), Error> {
+fn lookup_walks_the_full_chain() -> Result<(), Error> {
     let (alice, alice_addr) = build_node(0xA1, 0x11)?;
     let (bob, bob_addr) = build_node(0xB2, 0x22)?;
     let (carol, carol_addr) = build_node(0xC3, 0x33)?;
@@ -141,8 +147,7 @@ fn lookup_walks_the_known_subgraph() -> Result<(), Error> {
     // bob <-> carol
     let (bob, carol) = handshake_pair(bob, carol, bob_addr, carol_addr, [0xE3; 32], [0xE4; 32])?;
     // carol <-> dave
-    let (_carol, _dave) =
-        handshake_pair(carol, dave, carol_addr, dave_addr, [0xE5; 32], [0xE6; 32])?;
+    let (carol, dave) = handshake_pair(carol, dave, carol_addr, dave_addr, [0xE5; 32], [0xE6; 32])?;
 
     // Sanity: alice knows only bob.
     check(alice.routing_table().contains(&bob_node_id), || {
@@ -155,38 +160,43 @@ fn lookup_walks_the_known_subgraph() -> Result<(), Error> {
         "alice should NOT yet know dave".to_owned()
     })?;
 
-    // Bob has both alice and carol in his table.  Park him in a
-    // daemon thread so he answers alice's FIND_NODE_REQ while
-    // alice's lookup is in flight.  The thread leaks; the OS reaps
-    // it when the test process exits.
-    spawn_responder(bob);
+    // Park bob, carol, and dave in daemon threads so they answer
+    // every inbound RPC (including transparent dials initiated by
+    // alice's lookup) in real time.  Each daemon uses a distinct
+    // ephemeral seed so concurrent handshakes don't collide.
+    spawn_responder(bob, [0xF1; 32]);
+    spawn_responder(carol, [0xF2; 32]);
+    spawn_responder(dave, [0xF3; 32]);
 
-    // Alice runs her synchronous lookup for dave.  Round 1 queries
-    // bob; bob responds with [alice, carol]; alice's table absorbs
-    // carol.  No further queryable peer remains (carol is not
-    // established), so the lookup terminates.
+    // Alice runs her synchronous lookup for dave.  Pass 4
+    // transparently dials carol then dave, walks the full chain,
+    // and finds dave.
     let (alice, peers) = alice
         .lookup_node(dave_node_id, LookupConfig::default(), || [0u8; 32])
         .run()?;
 
-    // The result should mention bob (queried directly) and carol
-    // (advertised by bob).  Dave is *not* surfaced because no peer
-    // alice can query has shaken hands with him directly.
+    // The result should mention everyone alice has heard of, with
+    // dave the closest to the target (he IS the target).
     let mentions_bob = peers.iter().any(|(id, _)| *id == bob_node_id);
     let mentions_carol = peers
         .iter()
         .any(|(id, addr)| *id == carol_node_id && *addr == carol_addr);
-    let mentions_dave = peers.iter().any(|(id, _)| *id == dave_node_id);
+    let mentions_dave = peers
+        .iter()
+        .any(|(id, addr)| *id == dave_node_id && *addr == dave_addr);
     check(mentions_bob, || {
         format!("lookup result should mention bob, got {peers:?}")
     })?;
     check(mentions_carol, || {
-        format!("lookup result should mention carol with her address, got {peers:?}")
+        format!("lookup result should mention carol, got {peers:?}")
     })?;
-    check(!mentions_dave, || {
-        "pass 3 lookup should not surface dave (no path through alice)".to_owned()
+    check(mentions_dave, || {
+        format!("pass 4 lookup should now reach dave through transparent dialing, got {peers:?}")
     })?;
     check(alice.routing_table().contains(&carol_node_id), || {
         "alice's table should know carol after the lookup".to_owned()
+    })?;
+    check(alice.routing_table().contains(&dave_node_id), || {
+        "alice's table should know dave after the lookup".to_owned()
     })
 }
