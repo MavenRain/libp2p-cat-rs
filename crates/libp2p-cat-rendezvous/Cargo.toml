@@ -1,0 +1,22 @@
+[package]
+name = "libp2p-cat-rendezvous"
+description = "Rendezvous primitives for libp2p-cat-rs: STUN-style address observation today, hole-punch coordination later."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+comp-cat-rs = { workspace = true }
+libp2p-cat-host = { workspace = true }
+libp2p-cat-noise = { workspace = true }
+libp2p-cat-types = { workspace = true }
+
+[dev-dependencies]
+libp2p-cat-identity = { workspace = true }
+libp2p-cat-udp = { workspace = true }
+
+[lints]
+workspace = true

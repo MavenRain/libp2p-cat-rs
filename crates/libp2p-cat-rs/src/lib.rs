@@ -74,5 +74,10 @@ pub use libp2p_cat_pubsub::{
     KIND_APP, KIND_PUBSUB, MAX_TOPIC_LEN, MuxEvent, PubsubFrame, PubsubMux, Topic,
     decode as decode_pubsub_frame, encode as encode_pubsub_frame, unused_relay_rng,
 };
+pub use libp2p_cat_rendezvous::{
+    Frame as RendezvousFrame, OBSERVE_RESP_V4_LEN, OBSERVE_RESP_V6_LEN, Opcode as RendezvousOpcode,
+    RendezvousEvent, RendezvousNode, decode as decode_rendezvous_frame,
+    encode as encode_rendezvous_frame,
+};
 pub use libp2p_cat_types::{Error, MAX_INLINE_KEY_BYTES, PeerId, ProtocolId, UdpAddr};
 pub use libp2p_cat_udp::{DEFAULT_MAX_DATAGRAM, MAX_UDP_PAYLOAD, UdpTransport};

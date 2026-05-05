@@ -30,6 +30,7 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop; verifies every peer's identity binding and surfaces the resolved `PeerId` on `HandshakeComplete`. |
 | `libp2p-cat-pubsub`    | `PubsubMux` over `Host`: kind-byte multiplexed app data + RLNC pubsub with source / decoder / relay roles. |
 | `libp2p-cat-kad`       | Kademlia DHT: `NodeId`, XOR `Distance`, k-buckets, `RoutingTable`, a `KademliaNode` driver over `Host` that auto-answers `PING` / `FIND_NODE`, and a synchronous iterative `lookup_node` that transparently dials newly-discovered peers and converges to up to `k` peers closest to a target. |
+| `libp2p-cat-rendezvous`| NAT-traversal primitives: `RendezvousNode` over `Host` exposing a STUN-style `OBSERVE` RPC.  Pass 6 will add `PUNCH` coordination. |
 | `libp2p-cat-rs`        | Top-level umbrella re-exporting all of the above.        |
 
 A runnable two-peer chat example lives at `examples/chat/`:
@@ -54,7 +55,8 @@ Future:
 
 | Piece                  | Purpose                                                  |
 | ---------------------- | -------------------------------------------------------- |
-| NAT traversal          | Rendezvous-based UDP hole-punching.                      |
+| Rendezvous (pass 6)    | Coordinated `PUNCH` so two peers behind restricted-cone NATs can establish via simultaneous outbound. |
+| Rendezvous (later)     | TURN-style relay fallback for symmetric NATs.            |
 
 ## Why UDP-only?
 

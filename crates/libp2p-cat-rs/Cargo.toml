@@ -16,6 +16,7 @@ libp2p-cat-identity = { workspace = true }
 libp2p-cat-pubsub = { workspace = true }
 libp2p-cat-host = { workspace = true }
 libp2p-cat-kad = { workspace = true }
+libp2p-cat-rendezvous = { workspace = true }
 
 [lints]
 workspace = true
