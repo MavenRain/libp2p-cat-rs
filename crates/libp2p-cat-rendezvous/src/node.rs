@@ -9,6 +9,23 @@
 //! Every node plays both client and server roles symmetrically, the
 //! way [`KademliaNode`](libp2p_cat_kad::KademliaNode) plays both
 //! PING roles.
+//!
+//! # Mux composability (pass 8)
+//!
+//! [`RendezvousNode::split`] and [`RendezvousNode::join`] expose the
+//! "joined" / "decomposed" views of the node so a multi-protocol mux
+//! can hold the underlying [`Host`] alongside other protocols' state
+//! and reconstitute a transient `RendezvousNode` for each inbound
+//! plaintext.  Rendezvous owns no protocol state beyond the [`Host`],
+//! so the second component of [`RendezvousNode::split`]'s tuple is
+//! `()`; the same shape applies to the stateful protocols.
+//!
+//! [`RendezvousNode::process_plaintext`] performs the protocol-level
+//! reaction to a single freshly-decrypted plaintext datagram, with
+//! no socket-level dispatch.  Standalone deployments go through
+//! [`RendezvousNode::recv_one`], which reads one datagram from the
+//! socket, surfaces handshake-shaped events directly, and routes
+//! [`HostEvent::DatagramDelivered`] through `process_plaintext`.
 
 use comp_cat_rs::effect::io::Io;
 
@@ -27,6 +44,26 @@ pub struct RendezvousNode {
 impl RendezvousNode {
     /// Build a node from a [`Host`].
     pub fn new(host: Host) -> Self {
+        Self { host }
+    }
+
+    /// Decompose this node into its underlying [`Host`] and protocol
+    /// state.  Rendezvous owns no extra state, so the second tuple
+    /// component is `()`.
+    ///
+    /// Used by the multi-protocol mux to share a single [`Host`]
+    /// across protocols: the mux holds the [`Host`] alongside other
+    /// protocols' state and reconstitutes a transient
+    /// [`RendezvousNode`] via [`Self::join`] for each rendezvous-
+    /// kinded inbound plaintext.
+    pub fn split(self) -> (Host, ()) {
+        let Self { host } = self;
+        (host, ())
+    }
+
+    /// Inverse of [`Self::split`]: build a node from a [`Host`] and
+    /// protocol state.
+    pub fn join(host: Host, _state: ()) -> Self {
         Self { host }
     }
 
@@ -139,6 +176,12 @@ impl RendezvousNode {
     /// punch datagram at the original initiator, all *before* the
     /// corresponding "received" variant is emitted.
     ///
+    /// Internally factored as `host.recv_one` (which surfaces
+    /// handshake-shaped events directly) followed by
+    /// [`Self::process_plaintext`] on the
+    /// [`HostEvent::DatagramDelivered`] arm; the multi-protocol mux
+    /// reuses the latter directly.
+    ///
     /// # Errors
     ///
     /// Underlying socket failures propagate as `Err`; per-peer issues
@@ -148,6 +191,36 @@ impl RendezvousNode {
         let Self { host } = self;
         host.recv_one(ephemeral_seed)
             .flat_map(move |(host, host_event)| handle_host_event(host, host_event))
+    }
+
+    /// React to a single freshly-decrypted plaintext datagram from
+    /// `addr`.  Performs only protocol-level work: decoding the
+    /// rendezvous frame, auto-replying `OBSERVE_REQ` / forwarding
+    /// `PUNCH_REQ` / firing a punch on `PUNCH_FORWARD`, and
+    /// surfacing the corresponding [`RendezvousEvent`].  Socket-
+    /// level dispatch (handshake progress, decrypt failure, etc.)
+    /// happens in [`Self::recv_one`] before this method is called,
+    /// so callers wiring this up directly (e.g. the multi-protocol
+    /// mux after peeling its kind byte) do not need to handle those
+    /// events here.
+    ///
+    /// `plaintext` is the decoded inner Noise plaintext; the
+    /// standalone [`Self::recv_one`] passes it straight through, the
+    /// mux passes its sub-slice after peeling its 1-byte kind tag.
+    ///
+    /// # Errors
+    ///
+    /// Underlying socket failures from auto-replies / auto-forwards
+    /// propagate as `Err`; malformed frames surface as
+    /// [`RendezvousEvent::Rejected`].
+    #[must_use]
+    pub fn process_plaintext(
+        self,
+        addr: UdpAddr,
+        plaintext: &[u8],
+    ) -> Io<Error, (Self, RendezvousEvent)> {
+        let Self { host } = self;
+        handle_datagram(host, addr, plaintext)
     }
 }
 
@@ -207,7 +280,9 @@ fn handle_host_event(host: Host, event: HostEvent) -> Io<Error, (RendezvousNode,
             RendezvousNode { host },
             RendezvousEvent::Rejected { addr, reason },
         )),
-        HostEvent::DatagramDelivered { addr, plaintext } => handle_datagram(host, addr, &plaintext),
+        HostEvent::DatagramDelivered { addr, plaintext } => {
+            RendezvousNode { host }.process_plaintext(addr, &plaintext)
+        }
     }
 }
 

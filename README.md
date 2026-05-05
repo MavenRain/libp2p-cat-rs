@@ -42,6 +42,17 @@ cargo run -p libp2p-cat-rs-example-chat -- 127.0.0.1:4001
 cargo run -p libp2p-cat-rs-example-chat -- 127.0.0.1:4002 127.0.0.1:4001
 ```
 
+A two-binary STUN-style address-observation demo lives at
+`examples/rendezvous-demo/`:
+
+```bash
+# terminal 1 (long-running rendezvous server)
+cargo run --bin rendezvous-server -- 127.0.0.1:5555
+
+# terminal 2 (one-shot client; prints the address the server saw)
+cargo run --bin rendezvous-observe -- 127.0.0.1:0 127.0.0.1:5555
+```
+
 `PubsubMux` is generic over an authenticator that implements
 `WireAuthenticator`.  Three stock impls ship in `libp2p-cat-pubsub`:
 
