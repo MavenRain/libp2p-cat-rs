@@ -15,6 +15,21 @@
 //!
 //! Iterative lookup driven by `FIND_NODE` responses is deferred to
 //! pass 3.
+//!
+//! # Mux composability (pass 8)
+//!
+//! [`KademliaNode::split`] and [`KademliaNode::join`] expose the
+//! "joined" / "decomposed" views of the node so a multi-protocol mux
+//! can hold the underlying [`Host`] alongside other protocols' state
+//! and reconstitute a transient `KademliaNode` for each inbound
+//! plaintext.  Kad's protocol state is the [`RoutingTable`].
+//!
+//! [`KademliaNode::process_plaintext`] performs the protocol-level
+//! reaction to a single freshly-decrypted plaintext datagram, with
+//! no socket-level dispatch.  Standalone deployments go through
+//! [`KademliaNode::recv_one`], which reads one datagram from the
+//! socket, surfaces handshake-shaped events directly, and routes
+//! [`HostEvent::DatagramDelivered`] through `process_plaintext`.
 
 use comp_cat_rs::effect::io::Io;
 
@@ -45,6 +60,30 @@ impl KademliaNode {
             host,
             table: RoutingTable::new(self_node_id, k),
         }
+    }
+
+    /// Decompose this node into its underlying [`Host`] and protocol
+    /// state.  Kad's protocol state is the [`RoutingTable`].
+    ///
+    /// Used by the multi-protocol mux to share a single [`Host`]
+    /// across protocols: the mux holds the [`Host`] alongside other
+    /// protocols' state and reconstitutes a transient
+    /// [`KademliaNode`] via [`Self::join`] for each kad-kinded inbound
+    /// plaintext.
+    pub fn split(self) -> (Host, RoutingTable) {
+        let Self { host, table } = self;
+        (host, table)
+    }
+
+    /// Inverse of [`Self::split`]: build a node from a [`Host`] and a
+    /// pre-existing [`RoutingTable`].
+    ///
+    /// The caller is responsible for ensuring `table.self_id()`
+    /// matches `NodeId::from_peer_id(host.peer_id())`; the mux
+    /// preserves this invariant by construction (it builds the table
+    /// once at startup and never swaps hosts).
+    pub fn join(host: Host, table: RoutingTable) -> Self {
+        Self { host, table }
     }
 
     /// Local libp2p-compatible [`PeerId`].
@@ -161,6 +200,12 @@ impl KademliaNode {
     /// is emitted; observed peers are auto-inserted into the routing
     /// table.
     ///
+    /// Internally factored as `host.recv_one` (which surfaces
+    /// handshake-shaped events directly) followed by
+    /// [`Self::process_plaintext`] on the
+    /// [`HostEvent::DatagramDelivered`] arm; the multi-protocol mux
+    /// reuses the latter directly.
+    ///
     /// # Errors
     ///
     /// Underlying socket failures propagate as `Err`; per-peer issues
@@ -170,6 +215,31 @@ impl KademliaNode {
         let Self { host, table } = self;
         host.recv_one(ephemeral_seed)
             .flat_map(move |(host, host_event)| handle_host_event(host, table, host_event))
+    }
+
+    /// React to a single freshly-decrypted plaintext datagram from
+    /// `addr`.  Performs only protocol-level work: decoding the kad
+    /// frame, auto-inserting the verified peer into the
+    /// [`RoutingTable`], auto-replying `PING_REQ` / `FIND_NODE_REQ`,
+    /// and surfacing the corresponding [`KadEvent`].  Socket-level
+    /// dispatch (handshake progress, decrypt failure, etc.) happens
+    /// in [`Self::recv_one`] before this method is called, so callers
+    /// wiring this up directly (e.g. the multi-protocol mux after
+    /// peeling its kind byte) do not need to handle those events
+    /// here.
+    ///
+    /// `plaintext` is the decoded inner Noise plaintext; the
+    /// standalone [`Self::recv_one`] passes it straight through, the
+    /// mux passes its sub-slice after peeling its 1-byte kind tag.
+    ///
+    /// # Errors
+    ///
+    /// Underlying socket failures from auto-replies propagate as
+    /// `Err`; malformed frames surface as [`KadEvent::Rejected`].
+    #[must_use]
+    pub fn process_plaintext(self, addr: UdpAddr, plaintext: &[u8]) -> Io<Error, (Self, KadEvent)> {
+        let Self { host, table } = self;
+        handle_datagram(host, table, addr, plaintext)
     }
 }
 
@@ -213,7 +283,7 @@ fn handle_host_event(
             KadEvent::Rejected { addr, reason },
         )),
         HostEvent::DatagramDelivered { addr, plaintext } => {
-            handle_datagram(host, table, addr, &plaintext)
+            KademliaNode::join(host, table).process_plaintext(addr, &plaintext)
         }
     }
 }
@@ -225,7 +295,19 @@ fn handle_datagram(
     plaintext: &[u8],
 ) -> Io<Error, (KademliaNode, KadEvent)> {
     match decode(plaintext) {
-        Err(e) => Io::pure((
+        Err(
+            e @ (Error::Io(_)
+            | Error::InvalidProtocolId { .. }
+            | Error::InvalidPeerId { .. }
+            | Error::DatagramTooLarge { .. }
+            | Error::NoiseDecrypt
+            | Error::NoiseProtocol { .. }
+            | Error::NoiseReplay { .. }
+            | Error::RlncLayer { .. }
+            | Error::PubsubProtocol { .. }
+            | Error::HostState { .. }
+            | Error::IdentityVerify { .. }),
+        ) => Io::pure((
             KademliaNode { host, table },
             KadEvent::Rejected {
                 addr,
