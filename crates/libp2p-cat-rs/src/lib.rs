@@ -64,6 +64,10 @@ pub use libp2p_cat_kad::{
     Opcode as KadOpcode, RoutingTable as KadRoutingTable, decode as decode_kad_frame,
     encode as encode_kad_frame,
 };
+pub use libp2p_cat_mux::{
+    KIND_APP as MUX_KIND_APP, KIND_KAD as MUX_KIND_KAD, KIND_PUBSUB as MUX_KIND_PUBSUB,
+    KIND_RENDEZVOUS as MUX_KIND_RENDEZVOUS, MultiProtocolEvent, MultiProtocolNode,
+};
 pub use libp2p_cat_noise::{
     Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_OVERHEAD_LEN,
     MESSAGE_3_OVERHEAD_LEN, REPLAY_WINDOW_BITS, Responder, ResponderAfterE, ResponderAfterResponse,

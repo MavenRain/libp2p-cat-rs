@@ -1,0 +1,26 @@
+[package]
+name = "libp2p-cat-mux"
+description = "Multi-protocol mux for libp2p-cat-rs: shares one Host (and one UDP socket) across pubsub, Kademlia, and rendezvous via a 1-byte kind-byte plaintext envelope."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+comp-cat-rs = { workspace = true }
+rlnc-cat-rs = { workspace = true }
+libp2p-cat-types = { workspace = true }
+libp2p-cat-noise = { workspace = true }
+libp2p-cat-host = { workspace = true }
+libp2p-cat-pubsub = { workspace = true }
+libp2p-cat-kad = { workspace = true }
+libp2p-cat-rendezvous = { workspace = true }
+
+[dev-dependencies]
+libp2p-cat-identity = { workspace = true }
+libp2p-cat-udp = { workspace = true }
+
+[lints]
+workspace = true

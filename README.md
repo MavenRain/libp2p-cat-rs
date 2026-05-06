@@ -31,6 +31,7 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | `libp2p-cat-pubsub`    | `PubsubMux` over `Host`: kind-byte multiplexed app data + RLNC pubsub with source / decoder / relay roles. |
 | `libp2p-cat-kad`       | Kademlia DHT: `NodeId`, XOR `Distance`, k-buckets, `RoutingTable`, a `KademliaNode` driver over `Host` that auto-answers `PING` / `FIND_NODE`, and a synchronous iterative `lookup_node` that transparently dials newly-discovered peers and converges to up to `k` peers closest to a target. |
 | `libp2p-cat-rendezvous`| NAT-traversal primitives: `RendezvousNode` over `Host` exposing STUN-style `OBSERVE` plus `PUNCH` coordination (server forwards a relay to the target, target auto-fires a bare-datagram punch back at the initiator). |
+| `libp2p-cat-mux`       | `MultiProtocolNode<A>`: holds one `Host` + `PubsubState<A>` + `RoutingTable`, dispatching a 1-byte kind-byte plaintext envelope (`KIND_APP` / `KIND_PUBSUB` / `KIND_KAD` / `KIND_RENDEZVOUS`) so all four flows share one UDP socket. |
 | `libp2p-cat-rs`        | Top-level umbrella re-exporting all of the above.        |
 
 A runnable two-peer chat example lives at `examples/chat/`:

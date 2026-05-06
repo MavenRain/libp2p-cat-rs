@@ -9,6 +9,7 @@ members = [
     "crates/libp2p-cat-host",
     "crates/libp2p-cat-kad",
     "crates/libp2p-cat-rendezvous",
+    "crates/libp2p-cat-mux",
     "crates/libp2p-cat-rs",
     "examples/chat",
     "examples/rendezvous-demo",
@@ -41,6 +42,7 @@ libp2p-cat-pubsub = { path = "crates/libp2p-cat-pubsub", version = "0.1.0" }
 libp2p-cat-host = { path = "crates/libp2p-cat-host", version = "0.1.0" }
 libp2p-cat-kad = { path = "crates/libp2p-cat-kad", version = "0.1.0" }
 libp2p-cat-rendezvous = { path = "crates/libp2p-cat-rendezvous", version = "0.1.0" }
+libp2p-cat-mux = { path = "crates/libp2p-cat-mux", version = "0.1.0" }
 libp2p-cat-rs = { path = "crates/libp2p-cat-rs", version = "0.1.0" }
 proptest = "1"
 
