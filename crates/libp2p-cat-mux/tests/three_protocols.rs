@@ -121,6 +121,7 @@ fn expect_handshake_progress(ev: MultiProtocolEvent, expected: UdpAddr) -> Resul
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected HandshakeProgress({expected}), got {ev:?}"),
         }),
@@ -144,6 +145,7 @@ fn expect_handshake_complete(ev: MultiProtocolEvent, expected: UdpAddr) -> Resul
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected HandshakeComplete({expected}), got {ev:?}"),
         }),
@@ -175,6 +177,7 @@ fn expect_app_data(
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected AppData({expected_addr}, {expected_bytes:?}), got {ev:?}"),
         }),
@@ -198,6 +201,7 @@ fn expect_kad_ping_request(ev: MultiProtocolEvent, expected_from: UdpAddr) -> Re
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected KadPingRequestReceived({expected_from}), got {ev:?}"),
         }),
@@ -221,6 +225,7 @@ fn expect_kad_ping_response(ev: MultiProtocolEvent, expected_from: UdpAddr) -> R
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected KadPingResponseReceived({expected_from}), got {ev:?}"),
         }),
@@ -244,6 +249,7 @@ fn expect_observe_request(ev: MultiProtocolEvent, expected_from: UdpAddr) -> Res
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected ObserveRequestReceived({expected_from}), got {ev:?}"),
         }),
@@ -275,6 +281,7 @@ fn expect_observe_response(
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!(
                 "expected ObserveResponseReceived({expected_from}, observed={expected_observed}), got {ev:?}"
@@ -300,6 +307,7 @@ fn expect_pubsub_absorbed(ev: MultiProtocolEvent, expected_topic: &Topic) -> Res
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected PubsubAbsorbed for {expected_topic}, got {ev:?}"),
         }),
@@ -336,6 +344,7 @@ fn expect_pubsub_delivered(
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => Err(Error::HostState {
             reason: format!("expected PubsubDelivered for {expected_topic}, got {ev:?}"),
         }),

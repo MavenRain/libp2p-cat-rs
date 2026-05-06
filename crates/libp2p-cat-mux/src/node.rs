@@ -16,7 +16,7 @@ use libp2p_cat_types::{Error, PeerId, UdpAddr};
 use rlnc_cat_rs::coding::piece::OriginalData;
 
 use crate::event::MultiProtocolEvent;
-use crate::{KIND_APP, KIND_KAD, KIND_PUBSUB, KIND_RENDEZVOUS};
+use crate::{KIND_APP, KIND_KAD, KIND_PUBSUB, KIND_RENDEZVOUS, KIND_RPC};
 
 /// A [`Host`] joined with [`PubsubState<A>`] and a Kademlia
 /// [`RoutingTable`], driving all three protocols over one socket.
@@ -373,6 +373,33 @@ where
             .map(|(node, lookup)| (node, lookup.top_k_results()))
     }
 
+    /// Send a serialized RPC envelope (the bytes produced by
+    /// `serde_json::to_vec` over a [`tarpc_cat::protocol::Envelope`])
+    /// to an established peer.  Prepends [`KIND_RPC`].  The matching
+    /// reply (if this is a request) will surface later as
+    /// [`MultiProtocolEvent::RpcDatagram`] with the response body.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::HostState`] if `peer` is not established.
+    /// - Noise / UDP errors propagate transparently.
+    ///
+    /// [`tarpc_cat::protocol::Envelope`]: https://docs.rs/tarpc-cat
+    #[must_use]
+    pub fn send_rpc(self, peer: UdpAddr, body: &[u8]) -> Io<Error, Self> {
+        let Self {
+            host,
+            pubsub_state,
+            kad_table,
+        } = self;
+        let plaintext = prefix_kind(KIND_RPC, body.to_vec());
+        host.send(peer, plaintext).map(move |host| Self {
+            host,
+            pubsub_state,
+            kad_table,
+        })
+    }
+
     /// Send an `OBSERVE_REQ` to a rendezvous server.  The matching
     /// `OBSERVE_RESP` will surface later as
     /// [`MultiProtocolEvent::ObserveResponseReceived`].
@@ -569,6 +596,17 @@ where
         () if kind == Some(KIND_RENDEZVOUS) => {
             let body = plaintext.get(1..).unwrap_or(&[]);
             dispatch_rendezvous(host, pubsub_state, kad_table, addr, body)
+        }
+        () if kind == Some(KIND_RPC) => {
+            let body: Vec<u8> = plaintext.get(1..).unwrap_or(&[]).to_vec();
+            Io::pure((
+                MultiProtocolNode {
+                    host,
+                    pubsub_state,
+                    kad_table,
+                },
+                MultiProtocolEvent::RpcDatagram { peer: addr, body },
+            ))
         }
         () if kind.is_none() => Io::pure((
             MultiProtocolNode {
@@ -933,6 +971,7 @@ fn absorb_lookup_event(
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => lookup,
     }
 }

@@ -160,6 +160,20 @@ pub enum MultiProtocolEvent {
         initiator: UdpAddr,
     },
 
+    /// A `KIND_RPC` plaintext arrived.  The mux peels the kind byte
+    /// and surfaces the remaining bytes (a serialized
+    /// [`tarpc_cat::protocol::Envelope`](https://docs.rs/tarpc-cat))
+    /// without parsing them; callers using
+    /// [`libp2p-cat-rpc`](https://crates.io/crates/libp2p-cat-rpc)
+    /// decode the body and dispatch.
+    RpcDatagram {
+        /// Source peer address.
+        peer: UdpAddr,
+        /// Bytes after the `KIND_RPC` envelope byte (a serialized
+        /// JSON envelope).
+        body: Vec<u8>,
+    },
+
     /// An inbound datagram was rejected.  Covers decrypt failures,
     /// unknown kind bytes, malformed protocol frames, and
     /// authenticator-tag rejections.  Per-peer issues surface here

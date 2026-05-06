@@ -1,0 +1,28 @@
+[package]
+name = "libp2p-cat-rpc"
+description = "RPC integration for libp2p-cat-rs: tarpc-cat over UDP+Noise+Identity via a HostTransport adapter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+
+[dependencies]
+comp-cat-rs = { workspace = true }
+tarpc-cat = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libp2p-cat-types = { workspace = true }
+libp2p-cat-noise = { workspace = true }
+libp2p-cat-host = { workspace = true }
+libp2p-cat-mux = { workspace = true }
+libp2p-cat-pubsub = { workspace = true }
+libp2p-cat-kad = { workspace = true }
+
+[dev-dependencies]
+libp2p-cat-identity = { workspace = true }
+libp2p-cat-udp = { workspace = true }
+
+[lints]
+workspace = true

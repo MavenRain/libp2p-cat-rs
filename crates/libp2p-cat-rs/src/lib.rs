@@ -66,7 +66,8 @@ pub use libp2p_cat_kad::{
 };
 pub use libp2p_cat_mux::{
     KIND_APP as MUX_KIND_APP, KIND_KAD as MUX_KIND_KAD, KIND_PUBSUB as MUX_KIND_PUBSUB,
-    KIND_RENDEZVOUS as MUX_KIND_RENDEZVOUS, MultiProtocolEvent, MultiProtocolNode,
+    KIND_RENDEZVOUS as MUX_KIND_RENDEZVOUS, KIND_RPC as MUX_KIND_RPC, MultiProtocolEvent,
+    MultiProtocolNode,
 };
 pub use libp2p_cat_noise::{
     Initiator, InitiatorAfterE, InitiatorAfterResponse, MESSAGE_1_LEN, MESSAGE_2_OVERHEAD_LEN,
@@ -82,6 +83,9 @@ pub use libp2p_cat_rendezvous::{
     Frame as RendezvousFrame, OBSERVE_RESP_V4_LEN, OBSERVE_RESP_V6_LEN, Opcode as RendezvousOpcode,
     RendezvousEvent, RendezvousNode, decode as decode_rendezvous_frame,
     encode as encode_rendezvous_frame,
+};
+pub use libp2p_cat_rpc::{
+    HostTransport as RpcHostTransport, ServeEvent as RpcServeEvent, serve_one as rpc_serve_one,
 };
 pub use libp2p_cat_types::{Error, MAX_INLINE_KEY_BYTES, PeerId, ProtocolId, UdpAddr};
 pub use libp2p_cat_udp::{DEFAULT_MAX_DATAGRAM, MAX_UDP_PAYLOAD, UdpTransport};

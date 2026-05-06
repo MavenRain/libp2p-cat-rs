@@ -21,6 +21,10 @@
 //! - [`KIND_PUBSUB`]     (`0x01`): the rest is a pubsub frame.
 //! - [`KIND_KAD`]        (`0x02`): the rest is a Kademlia frame.
 //! - [`KIND_RENDEZVOUS`] (`0x03`): the rest is a rendezvous frame.
+//! - [`KIND_RPC`]        (`0x04`): the rest is a serialized RPC
+//!   envelope handled by [`libp2p-cat-rpc`].
+//!
+//! [`libp2p-cat-rpc`]: https://crates.io/crates/libp2p-cat-rpc
 //!
 //! `KIND_APP` and `KIND_PUBSUB` use the same byte values as
 //! [`libp2p_cat_pubsub`]'s standalone wire format, so a mux peer
@@ -71,3 +75,13 @@ pub const KIND_KAD: u8 = 0x02;
 
 /// Plaintext discriminator for rendezvous RPC frames.
 pub const KIND_RENDEZVOUS: u8 = 0x03;
+
+/// Plaintext discriminator for `tarpc-cat`-style RPC envelope
+/// frames.  The mux surfaces inbound `KIND_RPC` plaintexts as
+/// [`MultiProtocolEvent::RpcDatagram`] without parsing the
+/// envelope; callers using [`libp2p-cat-rpc`] decode the body
+/// into a [`tarpc_cat::protocol::Envelope`].
+///
+/// [`libp2p-cat-rpc`]: https://crates.io/crates/libp2p-cat-rpc
+/// [`tarpc_cat::protocol::Envelope`]: https://docs.rs/tarpc-cat
+pub const KIND_RPC: u8 = 0x04;

@@ -103,6 +103,7 @@ fn expect_handshake_progress(ev: MultiProtocolEvent, expected: UdpAddr) -> Resul
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeProgress({expected}), got {other:?}"),
         }),
@@ -126,6 +127,7 @@ fn expect_handshake_complete(ev: MultiProtocolEvent, expected: UdpAddr) -> Resul
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeComplete({expected}), got {other:?}"),
         }),
