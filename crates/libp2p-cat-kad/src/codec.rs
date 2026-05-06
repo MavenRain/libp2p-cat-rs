@@ -480,24 +480,14 @@ mod tests {
         // PingReq has an empty body; trailing bytes must be rejected
         // so an attacker cannot smuggle a PING-shaped frame with a
         // payload past the parser.
-        match decode(&[0x00, 0xAA]) {
-            Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
-                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
-            }),
-        }
+        expect_protocol_rejection(decode(&[0x00, 0xAA]))
     }
 
     #[test]
     fn find_node_req_rejects_short_target() -> Result<(), Error> {
         // 1 (opcode) + 31 zeros (one byte short of NODE_ID_LEN).
         let truncated: Vec<u8> = core::iter::once(0x02u8).chain([0u8; 31]).collect();
-        match decode(&truncated) {
-            Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
-                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
-            }),
-        }
+        expect_protocol_rejection(decode(&truncated))
     }
 
     #[test]
@@ -505,12 +495,7 @@ mod tests {
         // count=2 but only one entry's worth of body.
         let mut bytes = vec![0x03u8, 0x02u8];
         bytes.extend(core::iter::repeat_n(0u8, ENTRY_V4_LEN));
-        match decode(&bytes) {
-            Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
-                reason: format!("expected PubsubProtocol rejection, got {other:?}"),
-            }),
-        }
+        expect_protocol_rejection(decode(&bytes))
     }
 
     #[test]
@@ -522,10 +507,31 @@ mod tests {
             .chain(core::iter::once(0x09u8))
             .chain([0u8; 6])
             .collect();
-        match decode(&bytes) {
+        expect_protocol_rejection(decode(&bytes))
+    }
+
+    /// Helper: assert that `outcome` is `Err(Error::PubsubProtocol)`,
+    /// enumerating every other `Error` variant and the `Ok` case
+    /// explicitly so a new variant cannot silently slip through.
+    fn expect_protocol_rejection(outcome: Result<Frame, Error>) -> Result<(), Error> {
+        match outcome {
             Err(Error::PubsubProtocol { .. }) => Ok(()),
-            other => Err(Error::HostState {
+            Err(
+                other @ (Error::Io(_)
+                | Error::InvalidProtocolId { .. }
+                | Error::InvalidPeerId { .. }
+                | Error::DatagramTooLarge { .. }
+                | Error::NoiseDecrypt
+                | Error::NoiseProtocol { .. }
+                | Error::NoiseReplay { .. }
+                | Error::RlncLayer { .. }
+                | Error::HostState { .. }
+                | Error::IdentityVerify { .. }),
+            ) => Err(Error::HostState {
                 reason: format!("expected PubsubProtocol rejection, got {other:?}"),
+            }),
+            Ok(parsed) => Err(Error::HostState {
+                reason: format!("expected rejection, got Ok({parsed:?})"),
             }),
         }
     }
