@@ -232,15 +232,55 @@ impl KademliaNode {
     /// standalone [`Self::recv_one`] passes it straight through, the
     /// mux passes its sub-slice after peeling its 1-byte kind tag.
     ///
+    /// Standalone callers should use this method.  Multi-protocol
+    /// mux callers whose envelope prepends a kind byte to every
+    /// outbound plaintext should use [`Self::process_plaintext_with_wrap`]
+    /// to share their kind-byte prefix logic with the auto-reply
+    /// path inside this method.
+    ///
     /// # Errors
     ///
     /// Underlying socket failures from auto-replies propagate as
     /// `Err`; malformed frames surface as [`KadEvent::Rejected`].
     #[must_use]
     pub fn process_plaintext(self, addr: UdpAddr, plaintext: &[u8]) -> Io<Error, (Self, KadEvent)> {
-        let Self { host, table } = self;
-        handle_datagram(host, table, addr, plaintext)
+        self.process_plaintext_with_wrap(addr, plaintext, identity_wrap)
     }
+
+    /// Variant of [`Self::process_plaintext`] that applies `wrap` to
+    /// the encoded auto-reply frame bytes before handing them to
+    /// [`Host::send`].  The standalone `process_plaintext` calls
+    /// this with an identity wrap; the multi-protocol mux calls it
+    /// with a wrap that prepends its outer `KIND_KAD` envelope byte,
+    /// so the mux does not need to re-implement the auto-reply
+    /// dispatch.
+    ///
+    /// `wrap` is `FnOnce` because at most one auto-reply send fires
+    /// per call (`PingReq` → `PingResp` or `FindNodeReq` →
+    /// `FindNodeResp`); response variants drop the wrap unused.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::process_plaintext`].
+    #[must_use]
+    pub fn process_plaintext_with_wrap<W>(
+        self,
+        addr: UdpAddr,
+        plaintext: &[u8],
+        wrap: W,
+    ) -> Io<Error, (Self, KadEvent)>
+    where
+        W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+    {
+        let Self { host, table } = self;
+        handle_datagram(host, table, addr, plaintext, wrap)
+    }
+}
+
+/// Identity wrap used by the standalone path: send the kad frame
+/// bytes as-is.
+fn identity_wrap(bytes: Vec<u8>) -> Vec<u8> {
+    bytes
 }
 
 fn send_frame(node: KademliaNode, peer: UdpAddr, frame: Frame) -> Io<Error, KademliaNode> {
@@ -288,12 +328,16 @@ fn handle_host_event(
     }
 }
 
-fn handle_datagram(
+fn handle_datagram<W>(
     host: Host,
     table: RoutingTable,
     addr: UdpAddr,
     plaintext: &[u8],
-) -> Io<Error, (KademliaNode, KadEvent)> {
+    wrap: W,
+) -> Io<Error, (KademliaNode, KadEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     match decode(plaintext) {
         Err(
             e @ (Error::Io(_)
@@ -307,13 +351,16 @@ fn handle_datagram(
             | Error::PubsubProtocol { .. }
             | Error::HostState { .. }
             | Error::IdentityVerify { .. }),
-        ) => Io::pure((
-            KademliaNode { host, table },
-            KadEvent::Rejected {
-                addr,
-                reason: format!("kad decode failed: {e}"),
-            },
-        )),
+        ) => {
+            let _ = wrap;
+            Io::pure((
+                KademliaNode { host, table },
+                KadEvent::Rejected {
+                    addr,
+                    reason: format!("kad decode failed: {e}"),
+                },
+            ))
+        }
         Ok(frame) => {
             // Auto-insert the peer into the routing table on every
             // observed RPC, gated by the host's verified PeerId so we
@@ -325,25 +372,33 @@ fn handle_datagram(
                 }
                 None => table,
             };
-            dispatch_frame(host, table, addr, frame)
+            dispatch_frame(host, table, addr, frame, wrap)
         }
     }
 }
 
-fn dispatch_frame(
+fn dispatch_frame<W>(
     host: Host,
     table: RoutingTable,
     addr: UdpAddr,
     frame: Frame,
-) -> Io<Error, (KademliaNode, KadEvent)> {
+    wrap: W,
+) -> Io<Error, (KademliaNode, KadEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     match frame {
-        Frame::PingReq => auto_reply_ping(host, table, addr),
-        Frame::PingResp => Io::pure((
-            KademliaNode { host, table },
-            KadEvent::PingResponseReceived { from: addr },
-        )),
-        Frame::FindNodeReq { target } => auto_reply_find_node(host, table, addr, target),
+        Frame::PingReq => auto_reply_ping(host, table, addr, wrap),
+        Frame::PingResp => {
+            let _ = wrap;
+            Io::pure((
+                KademliaNode { host, table },
+                KadEvent::PingResponseReceived { from: addr },
+            ))
+        }
+        Frame::FindNodeReq { target } => auto_reply_find_node(host, table, addr, target, wrap),
         Frame::FindNodeResp { peers } => {
+            let _ = wrap;
             // Insert every peer the responder advertised.  Pass 3
             // will filter on liveness here.
             let table = peers.iter().fold(table, |acc, (id, peer_addr)| {
@@ -361,13 +416,17 @@ fn dispatch_frame(
     }
 }
 
-fn auto_reply_ping(
+fn auto_reply_ping<W>(
     host: Host,
     table: RoutingTable,
     addr: UdpAddr,
-) -> Io<Error, (KademliaNode, KadEvent)> {
+    wrap: W,
+) -> Io<Error, (KademliaNode, KadEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     Io::suspend(move || encode(&Frame::PingResp)).flat_map(move |bytes| {
-        host.send(addr, bytes).map(move |host| {
+        host.send(addr, wrap(bytes)).map(move |host| {
             (
                 KademliaNode { host, table },
                 KadEvent::PingRequestReceived { from: addr },
@@ -376,17 +435,21 @@ fn auto_reply_ping(
     })
 }
 
-fn auto_reply_find_node(
+fn auto_reply_find_node<W>(
     host: Host,
     table: RoutingTable,
     addr: UdpAddr,
     target: NodeId,
-) -> Io<Error, (KademliaNode, KadEvent)> {
+    wrap: W,
+) -> Io<Error, (KademliaNode, KadEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     let peers = table.closest_to(&target, table.k());
     let returned = peers.len();
     let frame = Frame::FindNodeResp { peers };
     Io::suspend(move || encode(&frame)).flat_map(move |bytes| {
-        host.send(addr, bytes).map(move |host| {
+        host.send(addr, wrap(bytes)).map(move |host| {
             (
                 KademliaNode { host, table },
                 KadEvent::FindNodeRequestReceived {

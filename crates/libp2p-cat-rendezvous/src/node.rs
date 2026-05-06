@@ -208,6 +208,13 @@ impl RendezvousNode {
     /// standalone [`Self::recv_one`] passes it straight through, the
     /// mux passes its sub-slice after peeling its 1-byte kind tag.
     ///
+    /// Standalone callers should use this method.  Multi-protocol
+    /// mux callers whose envelope prepends a kind byte to every
+    /// outbound plaintext should use
+    /// [`Self::process_plaintext_with_wrap`] to share their kind-
+    /// byte prefix logic with the auto-reply / auto-forward paths
+    /// inside this method.
+    ///
     /// # Errors
     ///
     /// Underlying socket failures from auto-replies / auto-forwards
@@ -219,9 +226,44 @@ impl RendezvousNode {
         addr: UdpAddr,
         plaintext: &[u8],
     ) -> Io<Error, (Self, RendezvousEvent)> {
-        let Self { host } = self;
-        handle_datagram(host, addr, plaintext)
+        self.process_plaintext_with_wrap(addr, plaintext, identity_wrap)
     }
+
+    /// Variant of [`Self::process_plaintext`] that applies `wrap` to
+    /// the encoded auto-reply / auto-forward frame bytes before
+    /// handing them to [`Host::send`].  The standalone
+    /// `process_plaintext` calls this with an identity wrap; the
+    /// multi-protocol mux calls it with a wrap that prepends its
+    /// outer `KIND_RENDEZVOUS` envelope byte, so the mux does not
+    /// need to re-implement the rendezvous dispatch.
+    ///
+    /// `wrap` is `FnOnce` because at most one Noise-wrapped send
+    /// fires per call.  The bare-datagram punch fired on
+    /// `PUNCH_FORWARD` goes through [`Host::send_raw`] (no Noise,
+    /// no kind byte) and bypasses the wrap entirely.
+    ///
+    /// # Errors
+    ///
+    /// Same set as [`Self::process_plaintext`].
+    #[must_use]
+    pub fn process_plaintext_with_wrap<W>(
+        self,
+        addr: UdpAddr,
+        plaintext: &[u8],
+        wrap: W,
+    ) -> Io<Error, (Self, RendezvousEvent)>
+    where
+        W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+    {
+        let Self { host } = self;
+        handle_datagram(host, addr, plaintext, wrap)
+    }
+}
+
+/// Identity wrap used by the standalone path: send the rendezvous
+/// frame bytes as-is.
+fn identity_wrap(bytes: Vec<u8>) -> Vec<u8> {
+    bytes
 }
 
 fn send_observe_req(node: RendezvousNode, server_addr: UdpAddr) -> Io<Error, RendezvousNode> {
@@ -286,11 +328,15 @@ fn handle_host_event(host: Host, event: HostEvent) -> Io<Error, (RendezvousNode,
     }
 }
 
-fn handle_datagram(
+fn handle_datagram<W>(
     host: Host,
     addr: UdpAddr,
     plaintext: &[u8],
-) -> Io<Error, (RendezvousNode, RendezvousEvent)> {
+    wrap: W,
+) -> Io<Error, (RendezvousNode, RendezvousEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     match decode(plaintext) {
         Err(
             e @ (Error::Io(_)
@@ -304,30 +350,46 @@ fn handle_datagram(
             | Error::PubsubProtocol { .. }
             | Error::HostState { .. }
             | Error::IdentityVerify { .. }),
-        ) => Io::pure((
-            RendezvousNode { host },
-            RendezvousEvent::Rejected {
-                addr,
-                reason: format!("rendezvous decode failed: {e}"),
-            },
-        )),
-        Ok(Frame::ObserveReq) => auto_reply_observe(host, addr),
-        Ok(Frame::ObserveResp { observed }) => Io::pure((
-            RendezvousNode { host },
-            RendezvousEvent::ObserveResponseReceived {
-                from: addr,
-                observed,
-            },
-        )),
-        Ok(Frame::PunchReq { target }) => auto_forward_punch(host, addr, target),
-        Ok(Frame::PunchForward { initiator }) => auto_send_punch(host, addr, initiator),
+        ) => {
+            let _ = wrap;
+            Io::pure((
+                RendezvousNode { host },
+                RendezvousEvent::Rejected {
+                    addr,
+                    reason: format!("rendezvous decode failed: {e}"),
+                },
+            ))
+        }
+        Ok(Frame::ObserveReq) => auto_reply_observe(host, addr, wrap),
+        Ok(Frame::ObserveResp { observed }) => {
+            let _ = wrap;
+            Io::pure((
+                RendezvousNode { host },
+                RendezvousEvent::ObserveResponseReceived {
+                    from: addr,
+                    observed,
+                },
+            ))
+        }
+        Ok(Frame::PunchReq { target }) => auto_forward_punch(host, addr, target, wrap),
+        Ok(Frame::PunchForward { initiator }) => {
+            let _ = wrap;
+            auto_send_punch(host, addr, initiator)
+        }
     }
 }
 
-fn auto_reply_observe(host: Host, addr: UdpAddr) -> Io<Error, (RendezvousNode, RendezvousEvent)> {
+fn auto_reply_observe<W>(
+    host: Host,
+    addr: UdpAddr,
+    wrap: W,
+) -> Io<Error, (RendezvousNode, RendezvousEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     let frame = Frame::ObserveResp { observed: addr };
     Io::suspend(move || encode(&frame)).flat_map(move |bytes| {
-        host.send(addr, bytes).map(move |host| {
+        host.send(addr, wrap(bytes)).map(move |host| {
             (
                 RendezvousNode { host },
                 RendezvousEvent::ObserveRequestReceived { from: addr },
@@ -339,15 +401,19 @@ fn auto_reply_observe(host: Host, addr: UdpAddr) -> Io<Error, (RendezvousNode, R
 /// Server-side: relay an inbound `PUNCH_REQ` to `target` if we
 /// have an established session with it.  Surfaces a
 /// [`RendezvousEvent::PunchRequestReceived`] either way.
-fn auto_forward_punch(
+fn auto_forward_punch<W>(
     host: Host,
     from: UdpAddr,
     target: UdpAddr,
-) -> Io<Error, (RendezvousNode, RendezvousEvent)> {
+    wrap: W,
+) -> Io<Error, (RendezvousNode, RendezvousEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
     if host.is_established(target) {
         let frame = Frame::PunchForward { initiator: from };
         Io::suspend(move || encode(&frame)).flat_map(move |bytes| {
-            host.send(target, bytes).map(move |host| {
+            host.send(target, wrap(bytes)).map(move |host| {
                 (
                     RendezvousNode { host },
                     RendezvousEvent::PunchRequestReceived {
@@ -359,6 +425,7 @@ fn auto_forward_punch(
             })
         })
     } else {
+        let _ = wrap;
         Io::pure((
             RendezvousNode { host },
             RendezvousEvent::PunchRequestReceived {

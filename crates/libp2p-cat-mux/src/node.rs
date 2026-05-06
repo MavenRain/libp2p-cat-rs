@@ -8,21 +8,15 @@ use std::sync::Arc;
 use comp_cat_rs::effect::io::Io;
 
 use libp2p_cat_host::{Host, HostEvent};
-use libp2p_cat_kad::{NodeId, RoutingTable};
+use libp2p_cat_kad::{KadEvent, KademliaNode, NodeId, RoutingTable};
 use libp2p_cat_pubsub::{MuxEvent as PubsubMuxEvent, PubsubAuth, PubsubMux, PubsubState, Topic};
+use libp2p_cat_rendezvous::{RendezvousEvent, RendezvousNode};
 use libp2p_cat_types::{Error, PeerId, UdpAddr};
 
 use rlnc_cat_rs::coding::piece::OriginalData;
 
 use crate::event::MultiProtocolEvent;
 use crate::{KIND_APP, KIND_KAD, KIND_PUBSUB, KIND_RENDEZVOUS};
-
-/// 1-byte bare-datagram punch payload.  Mirrors the value used by
-/// [`libp2p_cat_rendezvous`] in standalone mode; the precise byte
-/// is irrelevant — receivers see a 1-byte datagram (not the
-/// `MESSAGE_1_LEN`-byte handshake) and surface
-/// [`HostEvent::Rejected`].
-const PUNCH_BYTE: u8 = 0x00;
 
 /// A [`Host`] joined with [`PubsubState<A>`] and a Kademlia
 /// [`RoutingTable`], driving all three protocols over one socket.
@@ -370,16 +364,11 @@ fn send_with_kind(host: Host, addr: UdpAddr, kind: u8, body: Vec<u8>) -> Io<Erro
     host.send(addr, plaintext)
 }
 
-/// Auto-insert a peer into `table` gated on the host's verified
-/// `PeerId` for `addr`.  Returns the (possibly-updated) table.
-fn auto_insert_kad(host: &Host, table: RoutingTable, addr: UdpAddr) -> RoutingTable {
-    match host.remote_peer_id_of(addr) {
-        Some(peer_id) => {
-            let node_id = NodeId::from_peer_id(peer_id);
-            table.insert(node_id, addr).0
-        }
-        None => table,
-    }
+/// Wrap closure used by the kad / rendezvous protocol crates'
+/// `process_plaintext_with_wrap` paths to share their auto-reply
+/// frame bytes with the mux's outer kind-byte envelope.
+fn kind_wrap(kind: u8) -> impl FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static {
+    move |bytes| core::iter::once(kind).chain(bytes).collect()
 }
 
 fn handle_host_event<A, R>(
@@ -566,140 +555,50 @@ where
     A::Commitment: Clone + Send + Sync + 'static,
     A::Tag: Clone + Send + Sync + 'static,
 {
-    match libp2p_cat_kad::decode(body) {
-        Err(
-            e @ (Error::Io(_)
-            | Error::InvalidProtocolId { .. }
-            | Error::InvalidPeerId { .. }
-            | Error::DatagramTooLarge { .. }
-            | Error::NoiseDecrypt
-            | Error::NoiseProtocol { .. }
-            | Error::NoiseReplay { .. }
-            | Error::RlncLayer { .. }
-            | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }
-            | Error::IdentityVerify { .. }),
-        ) => Io::pure((
-            MultiProtocolNode {
+    let kad_node = KademliaNode::join(host, kad_table);
+    kad_node
+        .process_plaintext_with_wrap(addr, body, kind_wrap(KIND_KAD))
+        .map(move |(kad_node, ev)| {
+            let (host, kad_table) = kad_node.split();
+            let node = MultiProtocolNode {
                 host,
                 pubsub_state,
                 kad_table,
-            },
-            MultiProtocolEvent::Rejected {
-                addr,
-                reason: format!("kad decode failed: {e}"),
-            },
-        )),
-        Ok(frame) => {
-            let kad_table = auto_insert_kad(&host, kad_table, addr);
-            dispatch_kad_frame(host, pubsub_state, kad_table, addr, frame)
-        }
-    }
-}
-
-fn dispatch_kad_frame<A>(
-    host: Host,
-    pubsub_state: PubsubState<A>,
-    kad_table: RoutingTable,
-    addr: UdpAddr,
-    frame: libp2p_cat_kad::Frame,
-) -> Io<Error, (MultiProtocolNode<A>, MultiProtocolEvent)>
-where
-    A: PubsubAuth,
-    A::Commitment: Clone + Send + Sync + 'static,
-    A::Tag: Clone + Send + Sync + 'static,
-{
-    match frame {
-        libp2p_cat_kad::Frame::PingReq => kad_auto_reply_ping(host, pubsub_state, kad_table, addr),
-        libp2p_cat_kad::Frame::PingResp => Io::pure((
-            MultiProtocolNode {
-                host,
-                pubsub_state,
-                kad_table,
-            },
-            MultiProtocolEvent::KadPingResponseReceived { from: addr },
-        )),
-        libp2p_cat_kad::Frame::FindNodeReq { target } => {
-            kad_auto_reply_find_node(host, pubsub_state, kad_table, addr, target)
-        }
-        libp2p_cat_kad::Frame::FindNodeResp { peers } => {
-            let kad_table = peers.iter().fold(kad_table, |acc, (id, peer_addr)| {
-                if id == acc.self_id() {
-                    acc
-                } else {
-                    acc.insert(*id, *peer_addr).0
-                }
-            });
-            Io::pure((
-                MultiProtocolNode {
-                    host,
-                    pubsub_state,
-                    kad_table,
-                },
-                MultiProtocolEvent::KadFindNodeResponseReceived { from: addr, peers },
-            ))
-        }
-    }
-}
-
-fn kad_auto_reply_ping<A>(
-    host: Host,
-    pubsub_state: PubsubState<A>,
-    kad_table: RoutingTable,
-    addr: UdpAddr,
-) -> Io<Error, (MultiProtocolNode<A>, MultiProtocolEvent)>
-where
-    A: PubsubAuth,
-    A::Commitment: Clone + Send + Sync + 'static,
-    A::Tag: Clone + Send + Sync + 'static,
-{
-    Io::suspend(move || libp2p_cat_kad::encode(&libp2p_cat_kad::Frame::PingResp)).flat_map(
-        move |body| {
-            send_with_kind(host, addr, KIND_KAD, body).map(move |host| {
-                (
-                    MultiProtocolNode {
-                        host,
-                        pubsub_state,
-                        kad_table,
-                    },
-                    MultiProtocolEvent::KadPingRequestReceived { from: addr },
-                )
-            })
-        },
-    )
-}
-
-fn kad_auto_reply_find_node<A>(
-    host: Host,
-    pubsub_state: PubsubState<A>,
-    kad_table: RoutingTable,
-    addr: UdpAddr,
-    target: NodeId,
-) -> Io<Error, (MultiProtocolNode<A>, MultiProtocolEvent)>
-where
-    A: PubsubAuth,
-    A::Commitment: Clone + Send + Sync + 'static,
-    A::Tag: Clone + Send + Sync + 'static,
-{
-    let peers = kad_table.closest_to(&target, kad_table.k());
-    let returned = peers.len();
-    let frame = libp2p_cat_kad::Frame::FindNodeResp { peers };
-    Io::suspend(move || libp2p_cat_kad::encode(&frame)).flat_map(move |body| {
-        send_with_kind(host, addr, KIND_KAD, body).map(move |host| {
-            (
-                MultiProtocolNode {
-                    host,
-                    pubsub_state,
-                    kad_table,
-                },
-                MultiProtocolEvent::KadFindNodeRequestReceived {
-                    from: addr,
-                    target,
-                    returned,
-                },
-            )
+            };
+            (node, lift_kad_event(ev))
         })
-    })
+}
+
+fn lift_kad_event(ev: KadEvent) -> MultiProtocolEvent {
+    match ev {
+        KadEvent::PingRequestReceived { from } => {
+            MultiProtocolEvent::KadPingRequestReceived { from }
+        }
+        KadEvent::PingResponseReceived { from } => {
+            MultiProtocolEvent::KadPingResponseReceived { from }
+        }
+        KadEvent::FindNodeRequestReceived {
+            from,
+            target,
+            returned,
+        } => MultiProtocolEvent::KadFindNodeRequestReceived {
+            from,
+            target,
+            returned,
+        },
+        KadEvent::FindNodeResponseReceived { from, peers } => {
+            MultiProtocolEvent::KadFindNodeResponseReceived { from, peers }
+        }
+        KadEvent::Rejected { addr, reason } => MultiProtocolEvent::Rejected { addr, reason },
+        KadEvent::HandshakeProgress { addr } => MultiProtocolEvent::Rejected {
+            addr,
+            reason: "kad HandshakeProgress surfaced inside dispatch_kad (unreachable)".to_owned(),
+        },
+        KadEvent::HandshakeComplete { addr, .. } => MultiProtocolEvent::Rejected {
+            addr,
+            reason: "kad HandshakeComplete surfaced inside dispatch_kad (unreachable)".to_owned(),
+        },
+    }
 }
 
 fn dispatch_rendezvous<A>(
@@ -714,145 +613,52 @@ where
     A::Commitment: Clone + Send + Sync + 'static,
     A::Tag: Clone + Send + Sync + 'static,
 {
-    match libp2p_cat_rendezvous::decode(body) {
-        Err(
-            e @ (Error::Io(_)
-            | Error::InvalidProtocolId { .. }
-            | Error::InvalidPeerId { .. }
-            | Error::DatagramTooLarge { .. }
-            | Error::NoiseDecrypt
-            | Error::NoiseProtocol { .. }
-            | Error::NoiseReplay { .. }
-            | Error::RlncLayer { .. }
-            | Error::PubsubProtocol { .. }
-            | Error::HostState { .. }
-            | Error::IdentityVerify { .. }),
-        ) => Io::pure((
-            MultiProtocolNode {
+    let rendezvous_node = RendezvousNode::new(host);
+    rendezvous_node
+        .process_plaintext_with_wrap(addr, body, kind_wrap(KIND_RENDEZVOUS))
+        .map(move |(rendezvous_node, ev)| {
+            let (host, ()) = rendezvous_node.split();
+            let node = MultiProtocolNode {
                 host,
                 pubsub_state,
                 kad_table,
-            },
-            MultiProtocolEvent::Rejected {
-                addr,
-                reason: format!("rendezvous decode failed: {e}"),
-            },
-        )),
-        Ok(libp2p_cat_rendezvous::Frame::ObserveReq) => {
-            rendezvous_auto_reply_observe(host, pubsub_state, kad_table, addr)
-        }
-        Ok(libp2p_cat_rendezvous::Frame::ObserveResp { observed }) => Io::pure((
-            MultiProtocolNode {
-                host,
-                pubsub_state,
-                kad_table,
-            },
-            MultiProtocolEvent::ObserveResponseReceived {
-                from: addr,
-                observed,
-            },
-        )),
-        Ok(libp2p_cat_rendezvous::Frame::PunchReq { target }) => {
-            rendezvous_auto_forward_punch(host, pubsub_state, kad_table, addr, target)
-        }
-        Ok(libp2p_cat_rendezvous::Frame::PunchForward { initiator }) => {
-            rendezvous_auto_send_punch(host, pubsub_state, kad_table, addr, initiator)
-        }
-    }
-}
-
-fn rendezvous_auto_reply_observe<A>(
-    host: Host,
-    pubsub_state: PubsubState<A>,
-    kad_table: RoutingTable,
-    addr: UdpAddr,
-) -> Io<Error, (MultiProtocolNode<A>, MultiProtocolEvent)>
-where
-    A: PubsubAuth,
-    A::Commitment: Clone + Send + Sync + 'static,
-    A::Tag: Clone + Send + Sync + 'static,
-{
-    let frame = libp2p_cat_rendezvous::Frame::ObserveResp { observed: addr };
-    Io::suspend(move || libp2p_cat_rendezvous::encode(&frame)).flat_map(move |body| {
-        send_with_kind(host, addr, KIND_RENDEZVOUS, body).map(move |host| {
-            (
-                MultiProtocolNode {
-                    host,
-                    pubsub_state,
-                    kad_table,
-                },
-                MultiProtocolEvent::ObserveRequestReceived { from: addr },
-            )
+            };
+            (node, lift_rendezvous_event(ev))
         })
-    })
 }
 
-fn rendezvous_auto_forward_punch<A>(
-    host: Host,
-    pubsub_state: PubsubState<A>,
-    kad_table: RoutingTable,
-    from: UdpAddr,
-    target: UdpAddr,
-) -> Io<Error, (MultiProtocolNode<A>, MultiProtocolEvent)>
-where
-    A: PubsubAuth,
-    A::Commitment: Clone + Send + Sync + 'static,
-    A::Tag: Clone + Send + Sync + 'static,
-{
-    if host.is_established(target) {
-        let frame = libp2p_cat_rendezvous::Frame::PunchForward { initiator: from };
-        Io::suspend(move || libp2p_cat_rendezvous::encode(&frame)).flat_map(move |body| {
-            send_with_kind(host, target, KIND_RENDEZVOUS, body).map(move |host| {
-                (
-                    MultiProtocolNode {
-                        host,
-                        pubsub_state,
-                        kad_table,
-                    },
-                    MultiProtocolEvent::PunchRequestReceived {
-                        from,
-                        target,
-                        forwarded: true,
-                    },
-                )
-            })
-        })
-    } else {
-        Io::pure((
-            MultiProtocolNode {
-                host,
-                pubsub_state,
-                kad_table,
-            },
-            MultiProtocolEvent::PunchRequestReceived {
-                from,
-                target,
-                forwarded: false,
-            },
-        ))
+fn lift_rendezvous_event(ev: RendezvousEvent) -> MultiProtocolEvent {
+    match ev {
+        RendezvousEvent::ObserveRequestReceived { from } => {
+            MultiProtocolEvent::ObserveRequestReceived { from }
+        }
+        RendezvousEvent::ObserveResponseReceived { from, observed } => {
+            MultiProtocolEvent::ObserveResponseReceived { from, observed }
+        }
+        RendezvousEvent::PunchRequestReceived {
+            from,
+            target,
+            forwarded,
+        } => MultiProtocolEvent::PunchRequestReceived {
+            from,
+            target,
+            forwarded,
+        },
+        RendezvousEvent::PunchForwardReceived { from, initiator } => {
+            MultiProtocolEvent::PunchForwardReceived { from, initiator }
+        }
+        RendezvousEvent::Rejected { addr, reason } => MultiProtocolEvent::Rejected { addr, reason },
+        RendezvousEvent::HandshakeProgress { addr } => MultiProtocolEvent::Rejected {
+            addr,
+            reason:
+                "rendezvous HandshakeProgress surfaced inside dispatch_rendezvous (unreachable)"
+                    .to_owned(),
+        },
+        RendezvousEvent::HandshakeComplete { addr, .. } => MultiProtocolEvent::Rejected {
+            addr,
+            reason:
+                "rendezvous HandshakeComplete surfaced inside dispatch_rendezvous (unreachable)"
+                    .to_owned(),
+        },
     }
-}
-
-fn rendezvous_auto_send_punch<A>(
-    host: Host,
-    pubsub_state: PubsubState<A>,
-    kad_table: RoutingTable,
-    from: UdpAddr,
-    initiator: UdpAddr,
-) -> Io<Error, (MultiProtocolNode<A>, MultiProtocolEvent)>
-where
-    A: PubsubAuth,
-    A::Commitment: Clone + Send + Sync + 'static,
-    A::Tag: Clone + Send + Sync + 'static,
-{
-    host.send_raw(initiator, vec![PUNCH_BYTE]).map(move |host| {
-        (
-            MultiProtocolNode {
-                host,
-                pubsub_state,
-                kad_table,
-            },
-            MultiProtocolEvent::PunchForwardReceived { from, initiator },
-        )
-    })
 }
