@@ -165,6 +165,23 @@ impl Lookup {
         &self.target
     }
 
+    /// Borrow the lookup's [`LookupConfig`].  Exposed so external
+    /// drivers (e.g. the multi-protocol mux's lookup loop) can read
+    /// `max_recv_per_round` without re-threading the config as a
+    /// separate parameter.
+    pub fn config(&self) -> &LookupConfig {
+        &self.config
+    }
+
+    /// Whether any peer has an outstanding outbound action (dial or
+    /// query) waiting for a response.  Used by drain loops to know
+    /// when to stop reading even before the per-round budget is
+    /// exhausted.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending_queries.is_empty() || !self.pending_dials.is_empty()
+    }
+
     /// Iterate over shortlist entries in ascending distance order.
     pub fn entries(&self) -> impl Iterator<Item = &LookupEntry> {
         self.entries.values()

@@ -258,6 +258,51 @@ where
         self.send_kad_frame(peer, libp2p_cat_kad::Frame::FindNodeReq { target })
     }
 
+    /// Run an iterative `FIND_NODE` lookup for `target` to
+    /// completion, returning up to `config.k` peers closest to the
+    /// target.  Mirrors [`KademliaNode::lookup_node`] but drains
+    /// inbound traffic through [`Self::recv_one`], so non-kad
+    /// frames (`KIND_APP`, `KIND_PUBSUB`, `KIND_RENDEZVOUS`)
+    /// arriving during the lookup window still land in their
+    /// respective protocols' state.  The corresponding events are
+    /// silently consumed by the lookup driver — only the lookup
+    /// result is surfaced — so callers should expect to *see* only
+    /// kad-related state changes mid-lookup.
+    ///
+    /// `seed_factory` is called once per outbound transparent dial
+    /// and once per drain step; the standalone seed contract
+    /// applies.
+    ///
+    /// **Limitation**: relay-registered pubsub topics are not
+    /// supported during a lookup — the drain uses
+    /// [`libp2p_cat_pubsub::unused_relay_rng`], which errors if a
+    /// piece arrives for a recoder.  Callers that have registered
+    /// relay topics with [`Self::register_relay`] should not call
+    /// `lookup_node` until they un-register, or the lookup may
+    /// surface a relay-rng error.
+    ///
+    /// # Errors
+    ///
+    /// Underlying socket / Noise errors propagate transparently;
+    /// per-peer issues during drain are silently absorbed and the
+    /// lookup proceeds.
+    #[must_use]
+    pub fn lookup_node<F>(
+        self,
+        target: NodeId,
+        config: libp2p_cat_kad::LookupConfig,
+        seed_factory: F,
+    ) -> Io<Error, (Self, Vec<(NodeId, UdpAddr)>)>
+    where
+        F: Fn() -> [u8; 32] + Clone + Send + Sync + 'static,
+    {
+        let self_id = *self.node_id();
+        let initial = self.kad_table.closest_to(&target, config.k);
+        let lookup = libp2p_cat_kad::Lookup::new(self_id, target, config, &initial);
+        drive_lookup_rounds(self, lookup, seed_factory, config.max_rounds)
+            .map(|(node, lookup)| (node, lookup.top_k_results()))
+    }
+
     /// Send an `OBSERVE_REQ` to a rendezvous server.  The matching
     /// `OBSERVE_RESP` will surface later as
     /// [`MultiProtocolEvent::ObserveResponseReceived`].
@@ -660,5 +705,164 @@ fn lift_rendezvous_event(ev: RendezvousEvent) -> MultiProtocolEvent {
                 "rendezvous HandshakeComplete surfaced inside dispatch_rendezvous (unreachable)"
                     .to_owned(),
         },
+    }
+}
+
+/// One outbound action queued for a peer in the current lookup
+/// round.  Mirrors the private `RoundAction` in
+/// [`libp2p_cat_kad::lookup`]; the multi-protocol mux re-implements
+/// the driver because its outbound `find_node` send wraps the kad
+/// frame in the mux's `KIND_KAD` envelope (delegated to
+/// [`MultiProtocolNode::kad_find_node`]) and its drain consumes
+/// [`MultiProtocolEvent`] rather than [`KadEvent`].
+#[derive(Clone, Copy, Debug)]
+enum RoundAction {
+    /// Peer is already established; send `FIND_NODE_REQ` via the
+    /// mux's kad-find-node path.
+    Query { addr: UdpAddr },
+    /// Peer is not established; transparently dial with the
+    /// pre-allocated ephemeral seed.
+    Dial { addr: UdpAddr, seed: [u8; 32] },
+}
+
+fn drive_lookup_rounds<A, F>(
+    node: MultiProtocolNode<A>,
+    lookup: libp2p_cat_kad::Lookup,
+    seed_factory: F,
+    rounds_left: usize,
+) -> Io<Error, (MultiProtocolNode<A>, libp2p_cat_kad::Lookup)>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+    F: Fn() -> [u8; 32] + Clone + Send + Sync + 'static,
+{
+    match () {
+        () if rounds_left == 0 || lookup.is_done() => Io::pure((node, lookup)),
+        () => drive_lookup_round_pick(node, lookup, seed_factory, rounds_left),
+    }
+}
+
+fn drive_lookup_round_pick<A, F>(
+    node: MultiProtocolNode<A>,
+    lookup: libp2p_cat_kad::Lookup,
+    seed_factory: F,
+    rounds_left: usize,
+) -> Io<Error, (MultiProtocolNode<A>, libp2p_cat_kad::Lookup)>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+    F: Fn() -> [u8; 32] + Clone + Send + Sync + 'static,
+{
+    let to_act = lookup.pick_next_alpha();
+    match () {
+        () if to_act.is_empty() => Io::pure((node, lookup)),
+        () => {
+            // Decide each picked peer's action up front (queries
+            // need no seed; dials get a fresh ephemeral seed) so
+            // the closure chain below can move owned values cleanly.
+            let actions: Vec<(NodeId, RoundAction)> = to_act
+                .iter()
+                .map(|(id, addr)| {
+                    let action = if node.host().is_established(*addr) {
+                        RoundAction::Query { addr: *addr }
+                    } else {
+                        RoundAction::Dial {
+                            addr: *addr,
+                            seed: seed_factory(),
+                        }
+                    };
+                    (*id, action)
+                })
+                .collect();
+            let lookup_after_marks =
+                actions
+                    .iter()
+                    .fold(lookup, |acc, (id, action)| match action {
+                        RoundAction::Query { addr } => acc.mark_in_flight(*id, *addr),
+                        RoundAction::Dial { addr, .. } => acc.mark_dialing(*id, *addr),
+                    });
+            let target = *lookup_after_marks.target();
+            let send_chain: Io<Error, MultiProtocolNode<A>> =
+                actions.iter().fold(Io::pure(node), |acc, (_, action)| {
+                    let action = *action;
+                    acc.flat_map(move |n| match action {
+                        RoundAction::Query { addr } => n.kad_find_node(addr, target),
+                        RoundAction::Dial { addr, seed } => n.dial(addr, seed),
+                    })
+                });
+            let factory_for_drain = seed_factory.clone();
+            let factory_for_recurse = seed_factory;
+            send_chain.flat_map(move |node| {
+                let budget = lookup_after_marks.config().max_recv_per_round;
+                drain_lookup_responses(node, lookup_after_marks, factory_for_drain, budget)
+                    .flat_map(move |(node, lookup_after_drain)| {
+                        let lookup = lookup_after_drain
+                            .skip_pending_queries()
+                            .skip_pending_dials();
+                        drive_lookup_rounds(node, lookup, factory_for_recurse, rounds_left - 1)
+                    })
+            })
+        }
+    }
+}
+
+fn drain_lookup_responses<A, F>(
+    node: MultiProtocolNode<A>,
+    lookup: libp2p_cat_kad::Lookup,
+    seed_factory: F,
+    budget: usize,
+) -> Io<Error, (MultiProtocolNode<A>, libp2p_cat_kad::Lookup)>
+where
+    A: PubsubAuth,
+    A::Commitment: Clone + Send + Sync + 'static,
+    A::Tag: Clone + Send + Sync + 'static,
+    F: Fn() -> [u8; 32] + Clone + Send + Sync + 'static,
+{
+    match () {
+        () if budget == 0 || !lookup.has_pending() => Io::pure((node, lookup)),
+        () => {
+            let seed = seed_factory();
+            node.recv_one(seed, libp2p_cat_pubsub::unused_relay_rng())
+                .flat_map(move |(node, ev)| {
+                    let next_lookup = absorb_lookup_event(lookup, ev);
+                    drain_lookup_responses(node, next_lookup, seed_factory, budget - 1)
+                })
+        }
+    }
+}
+
+/// Update `lookup` based on a single inbound
+/// [`MultiProtocolEvent`].  Lookup-relevant variants
+/// (`KadFindNodeResponseReceived`, `HandshakeComplete` for a peer
+/// with a pending dial) advance the state machine; everything else
+/// is silently absorbed.
+fn absorb_lookup_event(
+    lookup: libp2p_cat_kad::Lookup,
+    ev: MultiProtocolEvent,
+) -> libp2p_cat_kad::Lookup {
+    match ev {
+        MultiProtocolEvent::KadFindNodeResponseReceived { from, peers } => {
+            let (next, _matched) = lookup.record_response(from, &peers);
+            next
+        }
+        MultiProtocolEvent::HandshakeComplete { addr, .. } if lookup.is_pending_dial(addr) => {
+            lookup.complete_dial(addr)
+        }
+        MultiProtocolEvent::HandshakeProgress { .. }
+        | MultiProtocolEvent::HandshakeComplete { .. }
+        | MultiProtocolEvent::AppData { .. }
+        | MultiProtocolEvent::PubsubAbsorbed { .. }
+        | MultiProtocolEvent::PubsubDelivered { .. }
+        | MultiProtocolEvent::PubsubRelayed { .. }
+        | MultiProtocolEvent::KadPingRequestReceived { .. }
+        | MultiProtocolEvent::KadPingResponseReceived { .. }
+        | MultiProtocolEvent::KadFindNodeRequestReceived { .. }
+        | MultiProtocolEvent::ObserveRequestReceived { .. }
+        | MultiProtocolEvent::ObserveResponseReceived { .. }
+        | MultiProtocolEvent::PunchRequestReceived { .. }
+        | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::Rejected { .. } => lookup,
     }
 }
