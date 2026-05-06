@@ -50,9 +50,11 @@
 
 #![forbid(unsafe_code)]
 
+mod capacity;
 mod event;
 mod host;
 mod state;
 
+pub use capacity::Capacity;
 pub use event::HostEvent;
 pub use host::Host;

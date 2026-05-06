@@ -50,7 +50,7 @@
 
 #![forbid(unsafe_code)]
 
-pub use libp2p_cat_host::{Host, HostEvent};
+pub use libp2p_cat_host::{Capacity as HostCapacity, Host, HostEvent};
 pub use libp2p_cat_identity::{
     DOMAIN_TAG as IDENTITY_DOMAIN_TAG, ED25519_PUBLIC_KEY_LEN, ED25519_SIGNATURE_LEN,
     Ed25519Keypair, Ed25519PublicKey, Ed25519Signature, SignedStaticKey,
