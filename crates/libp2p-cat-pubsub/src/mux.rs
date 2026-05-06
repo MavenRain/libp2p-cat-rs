@@ -75,7 +75,7 @@ use rlnc_cat_rs::gossip::{WirePiece, source};
 
 use crate::auth::PubsubAuth;
 use crate::codec;
-use crate::state::PubsubState;
+use crate::state::{DecoderEntry, PubsubState, RecoderEntry};
 use crate::topic::Topic;
 
 /// Plaintext discriminator for raw application data.
@@ -301,6 +301,44 @@ where
             host,
             state: state.register_relay(topic, piece_count, piece_byte_len, commitment),
         }
+    }
+
+    /// Drop the decoder registered for `topic`.  Pass-through to
+    /// [`PubsubState::unregister_topic`].
+    pub fn unregister_topic(self, topic: &Topic) -> Self {
+        let Self { host, state } = self;
+        Self {
+            host,
+            state: state.unregister_topic(topic),
+        }
+    }
+
+    /// Drop the recoder registered for `topic`.  Pass-through to
+    /// [`PubsubState::unregister_relay`].
+    pub fn unregister_relay(self, topic: &Topic) -> Self {
+        let Self { host, state } = self;
+        Self {
+            host,
+            state: state.unregister_relay(topic),
+        }
+    }
+
+    /// Sweep every decoder whose `last_activity` is more than
+    /// `max_idle_ticks` ticks behind the current pubsub-state tick.
+    /// Returns the mux plus the topics that were swept.
+    pub fn evict_idle_topics(self, max_idle_ticks: u64) -> (Self, Vec<Topic>) {
+        let Self { host, state } = self;
+        let (state, evicted) = state.evict_idle_topics(max_idle_ticks);
+        (Self { host, state }, evicted)
+    }
+
+    /// Sweep every recoder whose `last_activity` is more than
+    /// `max_idle_ticks` ticks behind the current pubsub-state tick.
+    /// Returns the mux plus the topics that were swept.
+    pub fn evict_idle_relays(self, max_idle_ticks: u64) -> (Self, Vec<Topic>) {
+        let Self { host, state } = self;
+        let (state, evicted) = state.evict_idle_relays(max_idle_ticks);
+        (Self { host, state }, evicted)
     }
 
     /// Send `payload` as a raw app-data plaintext to an established
@@ -645,6 +683,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn decoder_path<A>(
     host: Host,
     state: PubsubState<A>,
@@ -661,6 +700,7 @@ where
         auth,
         mut decoders,
         recoders,
+        tick,
     } = state;
     match decoders.remove(&topic) {
         None => (
@@ -670,6 +710,7 @@ where
                     auth,
                     decoders,
                     recoders,
+                    tick,
                 },
             },
             MuxEvent::Rejected {
@@ -677,11 +718,23 @@ where
                 reason: format!("decoder for topic {topic} vanished mid-dispatch"),
             },
         ),
-        Some((decoder, commitment)) => {
+        Some(entry) => {
+            let DecoderEntry {
+                state: decoder,
+                commitment,
+                last_activity,
+            } = entry;
             let verify_outcome = auth.verify(&commitment, wire_piece.piece(), wire_piece.tag());
             match verify_outcome {
                 Err(e) => {
-                    decoders.insert(topic.clone(), (decoder, commitment));
+                    decoders.insert(
+                        topic.clone(),
+                        DecoderEntry {
+                            state: decoder,
+                            commitment,
+                            last_activity,
+                        },
+                    );
                     (
                         PubsubMux {
                             host,
@@ -689,6 +742,7 @@ where
                                 auth,
                                 decoders,
                                 recoders,
+                                tick,
                             },
                         },
                         MuxEvent::Rejected {
@@ -705,6 +759,7 @@ where
                                 auth,
                                 decoders,
                                 recoders,
+                                tick,
                             },
                         },
                         MuxEvent::Rejected {
@@ -712,35 +767,48 @@ where
                             reason: format!("absorb failed: {e}"),
                         },
                     ),
-                    Ok(next) if next.is_complete() => match next.decode() {
-                        Ok(data) => (
-                            PubsubMux {
-                                host,
-                                state: PubsubState {
-                                    auth,
-                                    decoders,
-                                    recoders,
+                    Ok(next) if next.is_complete() => {
+                        let next_tick = tick.wrapping_add(1);
+                        match next.decode() {
+                            Ok(data) => (
+                                PubsubMux {
+                                    host,
+                                    state: PubsubState {
+                                        auth,
+                                        decoders,
+                                        recoders,
+                                        tick: next_tick,
+                                    },
                                 },
-                            },
-                            MuxEvent::PubsubDelivered { addr, topic, data },
-                        ),
-                        Err(e) => (
-                            PubsubMux {
-                                host,
-                                state: PubsubState {
-                                    auth,
-                                    decoders,
-                                    recoders,
+                                MuxEvent::PubsubDelivered { addr, topic, data },
+                            ),
+                            Err(e) => (
+                                PubsubMux {
+                                    host,
+                                    state: PubsubState {
+                                        auth,
+                                        decoders,
+                                        recoders,
+                                        tick: next_tick,
+                                    },
                                 },
-                            },
-                            MuxEvent::Rejected {
-                                addr,
-                                reason: format!("decode failed: {e}"),
-                            },
-                        ),
-                    },
+                                MuxEvent::Rejected {
+                                    addr,
+                                    reason: format!("decode failed: {e}"),
+                                },
+                            ),
+                        }
+                    }
                     Ok(next) => {
-                        decoders.insert(topic.clone(), (next, commitment));
+                        let next_tick = tick.wrapping_add(1);
+                        decoders.insert(
+                            topic.clone(),
+                            DecoderEntry {
+                                state: next,
+                                commitment,
+                                last_activity: next_tick,
+                            },
+                        );
                         (
                             PubsubMux {
                                 host,
@@ -748,6 +816,7 @@ where
                                     auth,
                                     decoders,
                                     recoders,
+                                    tick: next_tick,
                                 },
                             },
                             MuxEvent::PubsubAbsorbed { addr, topic },
@@ -778,6 +847,7 @@ where
         auth,
         decoders,
         mut recoders,
+        tick,
     } = state;
     match recoders.remove(&topic) {
         None => Io::pure((
@@ -787,6 +857,7 @@ where
                     auth,
                     decoders,
                     recoders,
+                    tick,
                 },
             },
             MuxEvent::Rejected {
@@ -794,11 +865,23 @@ where
                 reason: format!("recoder for topic {topic} vanished mid-dispatch"),
             },
         )),
-        Some((recoder, commitment)) => {
+        Some(entry) => {
+            let RecoderEntry {
+                recoder,
+                commitment,
+                last_activity,
+            } = entry;
             let verify_outcome = auth.verify(&commitment, wire_piece.piece(), wire_piece.tag());
             match verify_outcome {
                 Err(e) => {
-                    recoders.insert(topic.clone(), (recoder, commitment));
+                    recoders.insert(
+                        topic.clone(),
+                        RecoderEntry {
+                            recoder,
+                            commitment,
+                            last_activity,
+                        },
+                    );
                     Io::pure((
                         PubsubMux {
                             host,
@@ -806,6 +889,7 @@ where
                                 auth,
                                 decoders,
                                 recoders,
+                                tick,
                             },
                         },
                         MuxEvent::Rejected {
@@ -822,6 +906,7 @@ where
                                 auth,
                                 decoders,
                                 recoders,
+                                tick,
                             },
                         },
                         MuxEvent::Rejected {
@@ -833,7 +918,15 @@ where
                         let piece_count = wire_piece.piece().coding_vector().len();
                         let piece_byte_len = wire_piece.piece().data().len();
                         let recode_io = next_recoder.recode_one(relay_rng);
-                        recoders.insert(topic.clone(), (next_recoder, commitment.clone()));
+                        let next_tick = tick.wrapping_add(1);
+                        recoders.insert(
+                            topic.clone(),
+                            RecoderEntry {
+                                recoder: next_recoder,
+                                commitment: commitment.clone(),
+                                last_activity: next_tick,
+                            },
+                        );
                         let auth_for_tag = Arc::clone(&auth);
                         recode_io
                             .map_error(|e| Error::RlncLayer {
@@ -855,6 +948,7 @@ where
                                             auth,
                                             decoders,
                                             recoders,
+                                            tick: next_tick,
                                         },
                                     };
                                     send_frame_excluding(mux, &frame, addr).map(

@@ -169,6 +169,76 @@ where
         }
     }
 
+    /// Drop the decoder registered for `topic`.  Pass-through to
+    /// [`PubsubState::unregister_topic`].
+    pub fn unregister_topic(self, topic: &Topic) -> Self {
+        let Self {
+            host,
+            pubsub_state,
+            kad_table,
+        } = self;
+        Self {
+            host,
+            pubsub_state: pubsub_state.unregister_topic(topic),
+            kad_table,
+        }
+    }
+
+    /// Drop the recoder registered for `topic`.  Pass-through to
+    /// [`PubsubState::unregister_relay`].
+    pub fn unregister_relay(self, topic: &Topic) -> Self {
+        let Self {
+            host,
+            pubsub_state,
+            kad_table,
+        } = self;
+        Self {
+            host,
+            pubsub_state: pubsub_state.unregister_relay(topic),
+            kad_table,
+        }
+    }
+
+    /// Sweep every decoder whose `last_activity` is more than
+    /// `max_idle_ticks` ticks behind the current pubsub-state
+    /// tick.  Returns the node plus the topics that were swept.
+    pub fn evict_idle_topics(self, max_idle_ticks: u64) -> (Self, Vec<Topic>) {
+        let Self {
+            host,
+            pubsub_state,
+            kad_table,
+        } = self;
+        let (pubsub_state, evicted) = pubsub_state.evict_idle_topics(max_idle_ticks);
+        (
+            Self {
+                host,
+                pubsub_state,
+                kad_table,
+            },
+            evicted,
+        )
+    }
+
+    /// Sweep every recoder whose `last_activity` is more than
+    /// `max_idle_ticks` ticks behind the current pubsub-state
+    /// tick.  Returns the node plus the topics that were swept.
+    pub fn evict_idle_relays(self, max_idle_ticks: u64) -> (Self, Vec<Topic>) {
+        let Self {
+            host,
+            pubsub_state,
+            kad_table,
+        } = self;
+        let (pubsub_state, evicted) = pubsub_state.evict_idle_relays(max_idle_ticks);
+        (
+            Self {
+                host,
+                pubsub_state,
+                kad_table,
+            },
+            evicted,
+        )
+    }
+
     /// Send `payload` as a raw app-data plaintext to an established
     /// peer.  Delegates to [`PubsubMux::send_app`], which prepends
     /// [`KIND_APP`] (the same byte value the mux uses).
