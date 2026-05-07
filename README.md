@@ -30,7 +30,7 @@ This is a deliberately reduced re-imagining of [libp2p](https://libp2p.io):
 | `libp2p-cat-host`      | Connection-managing host: dial / send / recv loop; verifies every peer's identity binding and surfaces the resolved `PeerId` on `HandshakeComplete`. |
 | `libp2p-cat-pubsub`    | `PubsubMux` over `Host`: kind-byte multiplexed app data + RLNC pubsub with source / decoder / relay roles. |
 | `libp2p-cat-kad`       | Kademlia DHT: `NodeId`, XOR `Distance`, k-buckets, `RoutingTable`, a `KademliaNode` driver over `Host` that auto-answers `PING` / `FIND_NODE`, and a synchronous iterative `lookup_node` that transparently dials newly-discovered peers and converges to up to `k` peers closest to a target. |
-| `libp2p-cat-rendezvous`| NAT-traversal primitives: `RendezvousNode` over `Host` exposing STUN-style `OBSERVE` plus `PUNCH` coordination (server forwards a relay to the target, target auto-fires a bare-datagram punch back at the initiator). |
+| `libp2p-cat-rendezvous`| NAT-traversal primitives: `RendezvousNode` over `Host` exposing STUN-style `OBSERVE`, `PUNCH` coordination (server forwards a relay to the target, target auto-fires a bare-datagram punch back at the initiator), and TURN-style `RELAY_DATA` fallback for symmetric NATs (server forwards an opaque payload between two peers). |
 | `libp2p-cat-mux`       | `MultiProtocolNode<A>`: holds one `Host` + `PubsubState<A>` + `RoutingTable`, dispatching a 1-byte kind-byte plaintext envelope (`KIND_APP` / `KIND_PUBSUB` / `KIND_KAD` / `KIND_RENDEZVOUS` / `KIND_RPC`) so all five flows share one UDP socket. |
 | `libp2p-cat-rpc`       | `tarpc-cat` integration: `HostTransport` implements `tarpc_cat::transport::Transport` over a `Host`, and `serve_one` drives a single RPC request through a `tarpc_cat::Serve` implementation. |
 | `libp2p-cat-rs`        | Top-level umbrella re-exporting all of the above.        |
@@ -68,7 +68,8 @@ Future:
 
 | Piece                  | Purpose                                                  |
 | ---------------------- | -------------------------------------------------------- |
-| Rendezvous (later)     | TURN-style relay fallback for symmetric NATs.            |
+| End-to-end relay       | Layer a separate Noise handshake over `RELAY_DATA` so the relay sees only ciphertext.  Pass 9.7's `relay_via` exposes the bytes in plaintext to the relay. |
+| RPC retry policy       | Add explicit retries on top of `tarpc-cat` for control-plane RPCs.  Pass 9.6 ships the transport; retries are still future work. |
 
 ## Why UDP-only?
 

@@ -170,6 +170,38 @@ impl RendezvousNode {
             .flat_map(move |bytes| host.send(server_addr, bytes).map(move |host| Self { host }))
     }
 
+    /// TURN-style relay: ask `server_addr` (a relay) to forward
+    /// `payload` to `target_addr`.  The server forwards if it has
+    /// an established session with `target_addr`; otherwise it
+    /// replies with `RELAY_FAIL`, which the caller's next
+    /// [`Self::recv_one`] surfaces as
+    /// [`RendezvousEvent::RelayFailed`].
+    ///
+    /// The server sees `payload` in plaintext.  End-to-end privacy
+    /// requires the two endpoints to layer a separate Noise
+    /// handshake over the relay.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::HostState`] if `server_addr` is not yet
+    ///   established.
+    /// - Underlying socket / Noise errors propagate transparently.
+    #[must_use]
+    pub fn relay_via(
+        self,
+        server_addr: UdpAddr,
+        target_addr: UdpAddr,
+        payload: Vec<u8>,
+    ) -> Io<Error, Self> {
+        let frame = Frame::RelayDataReq {
+            target: target_addr,
+            payload,
+        };
+        let Self { host } = self;
+        Io::suspend(move || encode(&frame))
+            .flat_map(move |bytes| host.send(server_addr, bytes).map(move |host| Self { host }))
+    }
+
     /// Receive one event.  Inbound `OBSERVE_REQ`s are auto-answered,
     /// inbound `PUNCH_REQ`s are auto-forwarded (when the target is
     /// established), and inbound `PUNCH_FORWARD`s auto-fire a bare
@@ -294,6 +326,9 @@ where
         | RendezvousEvent::ObserveResponseReceived { .. }
         | RendezvousEvent::PunchRequestReceived { .. }
         | RendezvousEvent::PunchForwardReceived { .. }
+        | RendezvousEvent::RelayForwarded { .. }
+        | RendezvousEvent::RelayReceived { .. }
+        | RendezvousEvent::RelayFailed { .. }
         | RendezvousEvent::Rejected { .. } => {
             drain_for_observe_response(node, server_addr, factory_for_recurse)
         }
@@ -376,6 +411,34 @@ where
             let _ = wrap;
             auto_send_punch(host, addr, initiator)
         }
+        Ok(Frame::RelayDataReq { target, payload }) => {
+            auto_forward_relay(host, addr, target, payload, wrap)
+        }
+        Ok(Frame::RelayDataDeliver {
+            originator,
+            payload,
+        }) => {
+            let _ = wrap;
+            Io::pure((
+                RendezvousNode { host },
+                RendezvousEvent::RelayReceived {
+                    from: addr,
+                    originator,
+                    payload,
+                },
+            ))
+        }
+        Ok(Frame::RelayFail { peer, reason }) => {
+            let _ = wrap;
+            Io::pure((
+                RendezvousNode { host },
+                RendezvousEvent::RelayFailed {
+                    from: addr,
+                    peer,
+                    reason,
+                },
+            ))
+        }
     }
 }
 
@@ -453,6 +516,61 @@ fn auto_send_punch(
             RendezvousEvent::PunchForwardReceived { from, initiator },
         )
     })
+}
+
+/// Server-side: forward a `RELAY_DATA_REQ` payload from `from` to
+/// `target` if we have an established session with `target`,
+/// otherwise reply to the requester with `RELAY_FAIL`.  Either way,
+/// surface a [`RendezvousEvent::RelayForwarded`] with the
+/// `forwarded` flag set accordingly.
+fn auto_forward_relay<W>(
+    host: Host,
+    from: UdpAddr,
+    target: UdpAddr,
+    payload: Vec<u8>,
+    wrap: W,
+) -> Io<Error, (RendezvousNode, RendezvousEvent)>
+where
+    W: FnOnce(Vec<u8>) -> Vec<u8> + Send + 'static,
+{
+    let payload_len = payload.len();
+    if host.is_established(target) {
+        let frame = Frame::RelayDataDeliver {
+            originator: from,
+            payload,
+        };
+        Io::suspend(move || encode(&frame)).flat_map(move |bytes| {
+            host.send(target, wrap(bytes)).map(move |host| {
+                (
+                    RendezvousNode { host },
+                    RendezvousEvent::RelayForwarded {
+                        from,
+                        target,
+                        forwarded: true,
+                        payload_len,
+                    },
+                )
+            })
+        })
+    } else {
+        let frame = Frame::RelayFail {
+            peer: target,
+            reason: format!("relay: no established session with {target}"),
+        };
+        Io::suspend(move || encode(&frame)).flat_map(move |bytes| {
+            host.send(from, wrap(bytes)).map(move |host| {
+                (
+                    RendezvousNode { host },
+                    RendezvousEvent::RelayForwarded {
+                        from,
+                        target,
+                        forwarded: false,
+                        payload_len,
+                    },
+                )
+            })
+        })
+    }
 }
 
 /// The bare byte we send as a punch.  Any single byte works; we use

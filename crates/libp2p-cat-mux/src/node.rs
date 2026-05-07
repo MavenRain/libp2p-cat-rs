@@ -800,6 +800,29 @@ fn lift_rendezvous_event(ev: RendezvousEvent) -> MultiProtocolEvent {
         RendezvousEvent::PunchForwardReceived { from, initiator } => {
             MultiProtocolEvent::PunchForwardReceived { from, initiator }
         }
+        RendezvousEvent::RelayForwarded {
+            from,
+            target,
+            forwarded,
+            payload_len,
+        } => MultiProtocolEvent::RelayForwarded {
+            from,
+            target,
+            forwarded,
+            payload_len,
+        },
+        RendezvousEvent::RelayReceived {
+            from,
+            originator,
+            payload,
+        } => MultiProtocolEvent::RelayReceived {
+            from,
+            originator,
+            payload,
+        },
+        RendezvousEvent::RelayFailed { from, peer, reason } => {
+            MultiProtocolEvent::RelayFailed { from, peer, reason }
+        }
         RendezvousEvent::Rejected { addr, reason } => MultiProtocolEvent::Rejected { addr, reason },
         RendezvousEvent::HandshakeProgress { addr } => MultiProtocolEvent::Rejected {
             addr,
@@ -971,6 +994,9 @@ fn absorb_lookup_event(
         | MultiProtocolEvent::ObserveResponseReceived { .. }
         | MultiProtocolEvent::PunchRequestReceived { .. }
         | MultiProtocolEvent::PunchForwardReceived { .. }
+        | MultiProtocolEvent::RelayForwarded { .. }
+        | MultiProtocolEvent::RelayReceived { .. }
+        | MultiProtocolEvent::RelayFailed { .. }
         | MultiProtocolEvent::RpcDatagram { .. }
         | MultiProtocolEvent::Rejected { .. } => lookup,
     }

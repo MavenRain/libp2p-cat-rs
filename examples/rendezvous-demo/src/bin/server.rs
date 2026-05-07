@@ -93,6 +93,25 @@ fn log_event(event: &RendezvousEvent) -> Result<(), Error> {
         RendezvousEvent::PunchForwardReceived { from, initiator } => {
             format!("[punch-forward] from={from} initiator={initiator}")
         }
+        RendezvousEvent::RelayForwarded {
+            from,
+            target,
+            forwarded,
+            payload_len,
+        } => format!(
+            "[relay-fwd] from={from} target={target} forwarded={forwarded} payload_len={payload_len}"
+        ),
+        RendezvousEvent::RelayReceived {
+            from,
+            originator,
+            payload,
+        } => format!(
+            "[relay-recv] from={from} originator={originator} payload_len={}",
+            payload.len()
+        ),
+        RendezvousEvent::RelayFailed { from, peer, reason } => {
+            format!("[relay-fail] from={from} peer={peer} reason={reason}")
+        }
         RendezvousEvent::Rejected { addr, reason } => {
             format!("[rejected] addr={addr} reason={reason}")
         }

@@ -160,6 +160,44 @@ pub enum MultiProtocolEvent {
         initiator: UdpAddr,
     },
 
+    /// A peer asked us (acting as a relay server) to forward a
+    /// `RELAY_DATA_REQ` payload to `target`.  If `forwarded` is
+    /// true the relay actually delivered the payload to `target`;
+    /// otherwise a `RELAY_FAIL` was sent back to the requester.
+    RelayForwarded {
+        /// Address of the peer that asked.
+        from: UdpAddr,
+        /// Address the relay forwarded to (or tried to).
+        target: UdpAddr,
+        /// Whether the relay actually delivered the payload.
+        forwarded: bool,
+        /// Number of payload bytes the relay handled.
+        payload_len: usize,
+    },
+
+    /// A relay server forwarded an opaque payload from
+    /// `originator` to us.
+    RelayReceived {
+        /// Address of the relay server that forwarded the payload.
+        from: UdpAddr,
+        /// Address of the peer that originated the payload, as
+        /// observed by the relay server.
+        originator: UdpAddr,
+        /// Opaque forwarded bytes.
+        payload: Vec<u8>,
+    },
+
+    /// A relay server replied that it could not forward our
+    /// previous `RELAY_DATA_REQ` to `peer`.
+    RelayFailed {
+        /// Address of the relay server that replied.
+        from: UdpAddr,
+        /// Address the relay attempt targeted.
+        peer: UdpAddr,
+        /// UTF-8 description of why the forward failed.
+        reason: String,
+    },
+
     /// A `KIND_RPC` plaintext arrived.  The mux peels the kind byte
     /// and surfaces the remaining bytes (a serialized
     /// [`tarpc_cat::protocol::Envelope`](https://docs.rs/tarpc-cat))

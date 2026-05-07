@@ -51,6 +51,20 @@ pub enum Opcode {
     /// address; the receiver should fire a punch datagram at that
     /// initiator.
     PunchForward,
+    /// Client → relay server: please forward this opaque `payload`
+    /// to `target`.  The server forwards as
+    /// [`Opcode::RelayDataDeliver`] verbatim.
+    RelayDataReq,
+    /// Relay server → destination: a payload from `originator`
+    /// was forwarded to you.  Set by the server, never by the
+    /// origin client directly.  The destination treats `payload`
+    /// as opaque application bytes (or layers another protocol on
+    /// top).
+    RelayDataDeliver,
+    /// Server tells client it could not forward a previous
+    /// `RELAY_DATA_REQ` (e.g. no established session with the
+    /// target).
+    RelayFail,
 }
 
 impl Opcode {
@@ -62,6 +76,9 @@ impl Opcode {
             Self::ObserveResp => 0x01,
             Self::PunchReq => 0x02,
             Self::PunchForward => 0x03,
+            Self::RelayDataReq => 0x04,
+            Self::RelayDataDeliver => 0x05,
+            Self::RelayFail => 0x06,
         }
     }
 
@@ -77,6 +94,9 @@ impl Opcode {
             0x01 => Ok(Self::ObserveResp),
             0x02 => Ok(Self::PunchReq),
             0x03 => Ok(Self::PunchForward),
+            0x04 => Ok(Self::RelayDataReq),
+            0x05 => Ok(Self::RelayDataDeliver),
+            0x06 => Ok(Self::RelayFail),
             n => Err(protocol_error(format!(
                 "unknown rendezvous opcode 0x{n:02x}"
             ))),
@@ -109,6 +129,38 @@ pub enum Frame {
         /// Address of the peer that asked the server for the
         /// punch.
         initiator: UdpAddr,
+    },
+    /// Client → server: please forward `payload` to `target`.
+    ///
+    /// The server sees `payload` in plaintext.  End-to-end privacy
+    /// requires the two endpoints to layer a separate Noise
+    /// handshake over the relay; that's outside this codec's
+    /// concern.
+    RelayDataReq {
+        /// Destination peer the requester wants to reach via the
+        /// relay.
+        target: UdpAddr,
+        /// Opaque payload bytes, forwarded verbatim by the server.
+        payload: Vec<u8>,
+    },
+    /// Server → destination: a payload arrived from `originator`
+    /// via this relay.
+    RelayDataDeliver {
+        /// Address of the peer that originated the payload, as
+        /// observed by the relay server.
+        originator: UdpAddr,
+        /// Opaque payload bytes.
+        payload: Vec<u8>,
+    },
+    /// Server tells the caller it could not forward a previous
+    /// `RELAY_DATA_REQ` to `peer`.  Surfaced because the caller
+    /// would otherwise have no way to know whether the relay
+    /// attempt landed.
+    RelayFail {
+        /// The address the relay attempt targeted.
+        peer: UdpAddr,
+        /// UTF-8 description of why the forward failed.
+        reason: String,
     },
 }
 
@@ -143,6 +195,23 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, Error> {
             .collect()),
         Frame::PunchForward { initiator } => Ok(core::iter::once(Opcode::PunchForward.to_byte())
             .chain(encode_addr(initiator))
+            .collect()),
+        Frame::RelayDataReq { target, payload } => {
+            Ok(core::iter::once(Opcode::RelayDataReq.to_byte())
+                .chain(encode_addr(target))
+                .chain(payload.iter().copied())
+                .collect())
+        }
+        Frame::RelayDataDeliver {
+            originator,
+            payload,
+        } => Ok(core::iter::once(Opcode::RelayDataDeliver.to_byte())
+            .chain(encode_addr(originator))
+            .chain(payload.iter().copied())
+            .collect()),
+        Frame::RelayFail { peer, reason } => Ok(core::iter::once(Opcode::RelayFail.to_byte())
+            .chain(encode_addr(peer))
+            .chain(reason.as_bytes().iter().copied())
             .collect()),
     }
 }
@@ -181,7 +250,34 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, Error> {
         Opcode::PunchForward => {
             decode_addr_body(body, |initiator| Frame::PunchForward { initiator })
         }
+        Opcode::RelayDataReq => decode_relay_data_req(body),
+        Opcode::RelayDataDeliver => decode_relay_data_deliver(body),
+        Opcode::RelayFail => decode_relay_fail(body),
     }
+}
+
+fn decode_relay_data_req(body: &[u8]) -> Result<Frame, Error> {
+    let (target, consumed) = decode_addr(body)?;
+    let payload = body.get(consumed..).unwrap_or(&[]).to_vec();
+    Ok(Frame::RelayDataReq { target, payload })
+}
+
+fn decode_relay_data_deliver(body: &[u8]) -> Result<Frame, Error> {
+    let (originator, consumed) = decode_addr(body)?;
+    let payload = body.get(consumed..).unwrap_or(&[]).to_vec();
+    Ok(Frame::RelayDataDeliver {
+        originator,
+        payload,
+    })
+}
+
+fn decode_relay_fail(body: &[u8]) -> Result<Frame, Error> {
+    let (peer, consumed) = decode_addr(body)?;
+    let reason_bytes = body.get(consumed..).unwrap_or(&[]);
+    let reason = core::str::from_utf8(reason_bytes)
+        .map_err(|e| protocol_error(format!("RelayFail reason is not valid UTF-8: {e}")))?
+        .to_owned();
+    Ok(Frame::RelayFail { peer, reason })
 }
 
 fn decode_observe_req(body: &[u8]) -> Result<Frame, Error> {

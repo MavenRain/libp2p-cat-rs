@@ -78,6 +78,49 @@ pub enum RendezvousEvent {
         initiator: UdpAddr,
     },
 
+    /// A peer asked us (acting as a relay server) to forward a
+    /// `RELAY_DATA` payload to `target`.  If `forwarded` is true we
+    /// have already sent the corresponding `RELAY_DATA` to `target`
+    /// and the local action is complete; otherwise `target` was not
+    /// established and a `RELAY_FAIL` was sent back to the
+    /// requester.
+    RelayForwarded {
+        /// Address of the peer that asked.
+        from: UdpAddr,
+        /// Address of the peer the requester wanted to reach.
+        target: UdpAddr,
+        /// Whether the relay actually forwarded the payload.
+        forwarded: bool,
+        /// Number of payload bytes the relay handled.
+        payload_len: usize,
+    },
+
+    /// A relay server forwarded a `RELAY_DATA` payload to us.
+    /// `originator` is the address the relay observed the payload
+    /// arriving from; the caller treats `payload` as opaque
+    /// application bytes (or layers a separate protocol on top —
+    /// the relay sees these bytes in plaintext).
+    RelayReceived {
+        /// Address of the relay server that forwarded the payload.
+        from: UdpAddr,
+        /// Address of the peer that originated the payload, as
+        /// observed by the relay server.
+        originator: UdpAddr,
+        /// Opaque forwarded bytes.
+        payload: Vec<u8>,
+    },
+
+    /// A relay server replied that it could not forward our
+    /// previous `RELAY_DATA` to `peer`.
+    RelayFailed {
+        /// Address of the relay server that replied.
+        from: UdpAddr,
+        /// Address the relay attempt targeted.
+        peer: UdpAddr,
+        /// UTF-8 description of why the forward failed.
+        reason: String,
+    },
+
     /// An inbound datagram was rejected.  Per-peer issues (decrypt
     /// failure, malformed handshake, malformed RPC) surface as this
     /// event rather than as `Result::Err`, so a long-running event

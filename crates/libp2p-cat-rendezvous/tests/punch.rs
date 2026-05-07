@@ -53,6 +53,9 @@ fn expect_progress(ev: RendezvousEvent, expected_addr: UdpAddr) -> Result<(), Er
         | RendezvousEvent::ObserveResponseReceived { .. }
         | RendezvousEvent::PunchRequestReceived { .. }
         | RendezvousEvent::PunchForwardReceived { .. }
+        | RendezvousEvent::RelayForwarded { .. }
+        | RendezvousEvent::RelayReceived { .. }
+        | RendezvousEvent::RelayFailed { .. }
         | RendezvousEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeProgress({expected_addr}), got {other:?}"),
         }),
@@ -68,6 +71,9 @@ fn expect_complete(ev: RendezvousEvent, expected_addr: UdpAddr) -> Result<(), Er
         | RendezvousEvent::ObserveResponseReceived { .. }
         | RendezvousEvent::PunchRequestReceived { .. }
         | RendezvousEvent::PunchForwardReceived { .. }
+        | RendezvousEvent::RelayForwarded { .. }
+        | RendezvousEvent::RelayReceived { .. }
+        | RendezvousEvent::RelayFailed { .. }
         | RendezvousEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!("expected HandshakeComplete({expected_addr}), got {other:?}"),
         }),
@@ -146,6 +152,9 @@ fn punch_via_forwards_and_target_punches_back() -> Result<(), Error> {
         | RendezvousEvent::ObserveResponseReceived { .. }
         | RendezvousEvent::PunchRequestReceived { .. }
         | RendezvousEvent::PunchForwardReceived { .. }
+        | RendezvousEvent::RelayForwarded { .. }
+        | RendezvousEvent::RelayReceived { .. }
+        | RendezvousEvent::RelayFailed { .. }
         | RendezvousEvent::Rejected { .. }) => Err(Error::HostState {
             reason: format!(
                 "expected Rejected event from bob ({bob_addr}) carrying the bare punch, got {other:?}"
