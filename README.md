@@ -88,6 +88,22 @@ It costs us:
   non-interoperable fork on the wire, but PeerID-compatible at the
   identity layer.
 
+## Benchmarks
+
+Two `criterion` baselines ship with the workspace.  Run with:
+
+```bash
+# Kademlia routing-table closest_to (256-peer table, k = 20)
+cargo bench -p libp2p-cat-kad --bench routing_table
+
+# Pubsub frame codec round trip (NullAuthenticator, k = 8, b = 1024)
+cargo bench -p libp2p-cat-pubsub --bench codec
+```
+
+On an Apple-silicon laptop the closest_to query is ~2 µs and the
+pubsub round trip is ~500 ns; treat these as anchors for spotting
+regressions, not absolute targets.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
