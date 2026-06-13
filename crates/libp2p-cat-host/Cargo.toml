@@ -9,6 +9,7 @@ authors.workspace = true
 homepage.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 comp-cat-rs = { workspace = true }
 libp2p-cat-identity = { workspace = true }
 libp2p-cat-noise = { workspace = true }

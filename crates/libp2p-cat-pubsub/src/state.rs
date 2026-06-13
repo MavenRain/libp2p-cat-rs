@@ -45,8 +45,16 @@ where
 }
 
 /// Stored recoder entry: protocol state, the commitment the
-/// authenticator binds to, and the tick at which it was last
-/// touched.
+/// authenticator binds to, a rank tracker that gates relaying, and
+/// the tick at which it was last touched.
+///
+/// The rank tracker is a [`DecoderState`] used purely for its
+/// incremental rank computation: a verified inbound piece is stored
+/// and re-broadcast only when it increases the tracker's rank.
+/// Linearly dependent pieces are acknowledged but neither buffered
+/// nor relayed, which bounds the recoder to at most `piece_count`
+/// stored pieces and the relay to at most `piece_count` recoded
+/// emissions per generation, terminating multi-relay circulation.
 pub(crate) struct RecoderEntry<A>
 where
     A: PubsubAuth,
@@ -54,6 +62,7 @@ where
     A::Tag: Clone + Send + Sync + 'static,
 {
     pub recoder: Recoder,
+    pub rank_tracker: DecoderState,
     pub commitment: A::Commitment,
     pub last_activity: u64,
 }
@@ -154,10 +163,15 @@ where
 
     /// Pre-register a topic for the **relay** role: inbound pubsub
     /// frames for the topic will be verified against `commitment`,
-    /// added to a local recoder, recoded by random linear
-    /// combination, re-tagged with the local authenticator, and
-    /// fanned out to all peers except the source.  If a recoder is
-    /// already registered for `topic`, it is replaced.
+    /// rank-checked, added to a local recoder, recoded by random
+    /// linear combination, re-tagged with the local authenticator,
+    /// and fanned out to all peers except the source.  Pieces that
+    /// do not increase the relay's observed rank are neither stored
+    /// nor re-broadcast, which bounds a relay to at most
+    /// `piece_count` recoded emissions and `piece_count` buffered
+    /// pieces per generation and terminates multi-relay circulation.
+    /// If a recoder is already registered for `topic`, it is
+    /// replaced.
     pub fn register_relay(
         self,
         topic: Topic,
@@ -176,6 +190,7 @@ where
             topic,
             RecoderEntry {
                 recoder: Recoder::new(piece_count, piece_byte_len),
+                rank_tracker: DecoderState::new(piece_count, piece_byte_len),
                 commitment,
                 last_activity: next_tick,
             },

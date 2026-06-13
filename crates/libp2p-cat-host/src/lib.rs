@@ -34,14 +34,28 @@
 //! }
 //! ```
 //!
+//! # Source-address validation
+//!
+//! A host never answers a bare `msg1` with `msg2`.  It first issues
+//! a stateless cookie challenge that the initiator must echo from
+//! its claimed source address, so a **blind-spoof** attacker (one
+//! that cannot receive at the address it forges) can neither elicit
+//! a `msg2` reflection nor create handshake-table state.  A
+//! **return-routable** attacker is forced through the round-trip but
+//! is not rate-limited by the cookie alone; see [`cookie`] for the
+//! precise guarantee and its residual risk.  The full dial sequence
+//! is therefore five datagrams: `msg1`, cookie challenge,
+//! `msg1 || cookie`, `msg2`, `msg3`.
+//!
 //! # Why a seed per `recv_one` call?
 //!
-//! When an inbound datagram is a fresh `msg1` from a brand-new peer,
-//! the host immediately writes `msg2` and that requires a 32-byte
-//! ephemeral seed.  Other inbound shapes (post-handshake datagrams,
-//! advancing an in-flight handshake we initiated) do not need a
-//! seed.  The host has no way to peek before recv'ing, so the caller
-//! supplies a seed unconditionally; unused seeds are dropped.
+//! When an inbound datagram is a cookie-validated `msg1 || cookie`
+//! from a brand-new peer, the host immediately writes `msg2` and
+//! that requires a 32-byte ephemeral seed.  Other inbound shapes
+//! (post-handshake datagrams, bare `msg1`s, advancing an in-flight
+//! handshake we initiated) do not need a seed.  The host has no way
+//! to peek before recv'ing, so the caller supplies a seed
+//! unconditionally; unused seeds are dropped.
 //!
 //! [`UdpTransport`]: libp2p_cat_udp::UdpTransport
 //! [`StaticKeypair`]: libp2p_cat_noise::StaticKeypair
@@ -51,6 +65,7 @@
 #![forbid(unsafe_code)]
 
 mod capacity;
+pub mod cookie;
 mod event;
 mod host;
 mod state;

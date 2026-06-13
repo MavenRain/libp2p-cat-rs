@@ -67,7 +67,7 @@ fn build_host(seed: u8) -> Result<(Host, UdpAddr), Error> {
     let addr = socket.local_addr()?;
     let kp = StaticKeypair::from_private_bytes([seed; 32]);
     let id = Ed25519Keypair::from_seed([seed.wrapping_add(1); 32]);
-    let host = Host::new(socket, kp, &id)?;
+    let host = Host::new(socket, kp, &id, [seed.wrapping_add(2); 32])?;
     Ok((host, addr))
 }
 
@@ -80,6 +80,10 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(Host, Host), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
+    let (responder, ev) = responder.recv_one(responder_seed).run()?;
+    expect_handshake_progress(ev, initiator_addr)?;
+    let (initiator, ev) = initiator.recv_one([0; 32]).run()?;
+    expect_handshake_progress(ev, responder_addr)?;
     let (responder, ev) = responder.recv_one(responder_seed).run()?;
     expect_handshake_progress(ev, initiator_addr)?;
     let (initiator, ev) = initiator.recv_one([0; 32]).run()?;

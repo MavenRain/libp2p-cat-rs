@@ -1,11 +1,12 @@
 //! Post-handshake message exchange between two [`Host`]s.
 //!
-//! Drives the XX handshake to completion via `dial` / `recv_one`,
-//! then exercises [`Host::send`] / [`Host::recv_one`] on real loopback
-//! UDP datagrams in both directions.  A separate test confirms that a
-//! tampered transport datagram surfaces as a [`HostEvent::Rejected`]
-//! and drops the established connection (the v1 policy documented in
-//! `decrypt_established`).
+//! Drives the XX handshake (with its cookie round trip) to
+//! completion via `dial` / `recv_one`, then exercises [`Host::send`]
+//! / [`Host::recv_one`] on real loopback UDP datagrams in both
+//! directions.  Separate tests confirm that junk datagrams surface
+//! as [`HostEvent::Rejected`] without tearing down any state: an
+//! established session survives a garbage datagram from its peer's
+//! address.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -27,9 +28,10 @@ fn check(cond: bool, reason: impl FnOnce() -> String) -> Result<(), Error> {
     }
 }
 
-/// Drive the 3-message XX handshake to completion between two hosts
-/// and return them in `(initiator, responder)` order alongside their
-/// loopback addresses.
+/// Drive the XX handshake (cookie challenge, cookie echo, then the
+/// three Noise messages) to completion between two hosts and return
+/// them in `(initiator, responder)` order alongside their loopback
+/// addresses.
 fn established_pair() -> Result<(Host, Host, UdpAddr, UdpAddr), Error> {
     let alice_socket = UdpTransport::bind(loopback_v4()).run()?;
     let bob_socket = UdpTransport::bind(loopback_v4()).run()?;
@@ -41,10 +43,12 @@ fn established_pair() -> Result<(Host, Host, UdpAddr, UdpAddr), Error> {
     let alice_id = Ed25519Keypair::from_seed([0x31; 32]);
     let bob_id = Ed25519Keypair::from_seed([0x32; 32]);
 
-    let alice = Host::new(alice_socket, alice_kp, &alice_id)?
+    let alice = Host::new(alice_socket, alice_kp, &alice_id, [0x3A; 32])?
         .dial(bob_addr, [0xE1; 32])
         .run()?;
-    let bob = Host::new(bob_socket, bob_kp, &bob_id)?;
+    let bob = Host::new(bob_socket, bob_kp, &bob_id, [0x3B; 32])?;
+    let (bob, _ev_challenge) = bob.recv_one([0xE2; 32]).run()?;
+    let (alice, _ev_echo) = alice.recv_one([0; 32]).run()?;
     let (bob, _ev1) = bob.recv_one([0xE2; 32]).run()?;
     let (alice, _ev2) = alice.recv_one([0; 32]).run()?;
     let (bob, _ev3) = bob.recv_one([0; 32]).run()?;
@@ -123,7 +127,7 @@ fn send_to_unknown_peer_errors() -> Result<(), Error> {
     let alice_socket = UdpTransport::bind(loopback_v4()).run()?;
     let alice_kp = StaticKeypair::from_private_bytes([0xD1; 32]);
     let alice_id = Ed25519Keypair::from_seed([0x33; 32]);
-    let alice = Host::new(alice_socket, alice_kp, &alice_id)?;
+    let alice = Host::new(alice_socket, alice_kp, &alice_id, [0x3C; 32])?;
 
     // bind+drop bob's socket so we have a "valid" addr to target
     let bob_socket = UdpTransport::bind(loopback_v4()).run()?;
@@ -142,38 +146,59 @@ fn send_to_unknown_peer_errors() -> Result<(), Error> {
 }
 
 #[test]
-fn tampered_transport_datagram_drops_connection() -> Result<(), Error> {
+fn junk_from_unknown_peer_is_rejected() -> Result<(), Error> {
     let (alice, bob, _alice_addr, bob_addr) = established_pair()?;
 
-    // Alice encrypts a message normally; instead of sending via her
-    // host (which would advance her transport state cleanly), we
-    // intercept by sending a manually-corrupted datagram from her
-    // socket directly.  The simplest way is to have alice send the
-    // datagram, then have a separate sender on a fresh socket forge
-    // a junk datagram to bob's address.
-    //
-    // Forging is easier: we just send a plausible-looking but
-    // unauthenticated 24-byte datagram (TRANSPORT_OVERHEAD bytes).
+    // A fresh socket forges an unauthenticated 24-byte datagram
+    // (TRANSPORT_OVERHEAD bytes) to bob.  From bob's perspective it
+    // comes from a brand-new peer and is neither a bare msg1 (32
+    // bytes) nor a msg1-with-cookie (64 bytes), so the dispatcher
+    // rejects it without creating any state.
     let attacker_socket = UdpTransport::bind(loopback_v4()).run()?;
     let attacker_addr = attacker_socket.local_addr()?;
     let _attacker_after = attacker_socket
         .send(bob_addr, vec![0u8; libp2p_cat_noise::TRANSPORT_OVERHEAD])
         .run()?;
 
-    // From bob's perspective the datagram looks like it came from the
-    // attacker's address, which is a brand-new peer.  At length 24 it
-    // is *not* a valid `MESSAGE_1_LEN` (32) handshake, so the host's
-    // dispatcher hands it to `try_responder_msg1` which rejects it as
-    // "not a {MESSAGE_1_LEN}-byte handshake msg1" — so the path
-    // exercised here is the fresh-garbage rejection, not the
-    // tampered-established-datagram one.  Either way, we get a
-    // `Rejected` event without crashing the loop.
-    let (_bob, ev) = bob.recv_one([0; 32]).run()?;
+    let (bob, ev) = bob.recv_one([0; 32]).run()?;
     expect_rejected(ev, attacker_addr)?;
+    check(bob.handshakes_in_flight() == 0, || {
+        "junk from an unknown peer must not create handshake state".to_owned()
+    })?;
 
     // Alice's connection to bob is still intact since we never
     // tampered with traffic from her actual socket.
     check(alice.is_established(bob_addr), || {
         "alice's connection to bob should be unaffected".to_owned()
+    })
+}
+
+#[test]
+fn session_survives_junk_from_established_address() -> Result<(), Error> {
+    let (alice, bob, alice_addr, bob_addr) = established_pair()?;
+
+    // Junk arriving from an *established* peer's address (here sent
+    // via alice's real socket with `send_raw`, exactly what an
+    // off-path attacker spoofing her address would produce) must not
+    // tear down the session: the datagram is dropped, the connection
+    // and its replay window stay intact, and genuine traffic still
+    // flows afterwards.
+    let alice = alice
+        .send_raw(
+            bob_addr,
+            vec![0xFF; libp2p_cat_noise::TRANSPORT_OVERHEAD + 7],
+        )
+        .run()?;
+    let (bob, ev_junk) = bob.recv_one([0; 32]).run()?;
+    expect_rejected(ev_junk, alice_addr)?;
+    check(bob.is_established(alice_addr), || {
+        "bob must keep the established session after a junk datagram".to_owned()
+    })?;
+
+    let _alice = alice.send(bob_addr, b"still here".to_vec()).run()?;
+    let (bob, ev_real) = bob.recv_one([0; 32]).run()?;
+    expect_delivered(ev_real, alice_addr, b"still here")?;
+    check(bob.is_established(alice_addr), || {
+        "session should remain established after recovery".to_owned()
     })
 }

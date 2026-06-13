@@ -20,6 +20,13 @@ pub(crate) const AEAD_TAG_LEN: usize = 16;
 
 /// The Noise running state during a handshake: chaining key, hash,
 /// optional cipher key, and a per-AEAD-instance nonce counter.
+///
+/// `Clone` exists so the host can retain a copy of a stored
+/// handshake state before attempting a consuming transition, and
+/// re-store it when the transition fails on a corrupted or spoofed
+/// datagram.  The retained copy is only ever used when the consumed
+/// copy emitted nothing on the wire, so no nonce is ever reused.
+#[derive(Clone)]
 pub(crate) struct SymmetricState {
     chaining_key: [u8; KEY_LEN],
     hash: [u8; KEY_LEN],

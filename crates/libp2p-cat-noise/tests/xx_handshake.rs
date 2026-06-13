@@ -127,13 +127,15 @@ fn xx_handshake_completes_and_keys_agree() -> Result<(), Error> {
     let bob_to_alice = b"bob -> alice (longer message with entropy)".to_vec();
 
     let (alice_transport, datagram_a2b) = alice_transport.encrypt(&alice_to_bob)?;
-    let (bob_transport, recovered_a2b) = bob_transport.decrypt(&datagram_a2b)?;
+    let (bob_transport, recovered_a2b) = bob_transport.decrypt(&datagram_a2b);
+    let recovered_a2b = recovered_a2b?;
     check(recovered_a2b == alice_to_bob, || {
         format!("a->b mismatch: got {recovered_a2b:?}")
     })?;
 
     let (_bob_transport, datagram_b2a) = bob_transport.encrypt(&bob_to_alice)?;
-    let (_alice_transport, recovered_b2a) = alice_transport.decrypt(&datagram_b2a)?;
+    let (_alice_transport, recovered_b2a) = alice_transport.decrypt(&datagram_b2a);
+    let recovered_b2a = recovered_b2a?;
     check(recovered_b2a == bob_to_alice, || {
         format!("b->a mismatch: got {recovered_b2a:?}")
     })
@@ -154,6 +156,48 @@ fn xx_rejects_truncated_message_2() -> Result<(), Error> {
         .map(<[u8]>::to_vec)
         .unwrap_or_default();
     expect_noise_protocol(alice_after_e.read_response(&truncated))
+}
+
+#[test]
+fn retained_initiator_clone_completes_after_failed_read_response() -> Result<(), Error> {
+    // The host retains a clone of InitiatorAfterE so a corrupted or
+    // spoofed msg2 does not kill the in-flight handshake.  Reading
+    // msg2 performs no encryption, so retrying from the clone is
+    // nonce-safe: the resulting transport starts at send_nonce 0 and
+    // the derived session is valid.
+    let alice = StaticKeypair::from_private_bytes(ALICE_PRIVATE);
+    let bob = StaticKeypair::from_private_bytes(BOB_PRIVATE);
+    let (alice_after_e, msg1) = Initiator::new(alice).write_e(ALICE_EPH)?;
+    let bob_after_e = Responder::new(bob).read_e(&msg1)?;
+    let (bob_after_response, msg2) = bob_after_e.write_response(BOB_EPH, &[])?;
+
+    // Retain a clone, then fail the original on a tampered msg2.
+    let retained = alice_after_e.clone();
+    let tampered: Vec<u8> = msg2
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| if i == 32 + 47 { b ^ 0x01 } else { b })
+        .collect();
+    expect_noise_decrypt(alice_after_e.read_response(&tampered))?;
+
+    // The retained clone completes against the genuine msg2.
+    let (after_response, _payload) = retained.read_response(&msg2)?;
+    let (alice_transport, msg3, _bob_static) = after_response.write_s(&[])?;
+    check(alice_transport.send_nonce() == 0, || {
+        format!(
+            "retry transport must start at send_nonce 0, got {}",
+            alice_transport.send_nonce()
+        )
+    })?;
+
+    // The derived session is genuinely valid: bob reads the msg3 and
+    // a datagram round-trips.
+    let (bob_transport, _alice_static, _payload) = bob_after_response.read_s(&msg3)?;
+    let (_alice_after, datagram) = alice_transport.encrypt(b"after retry")?;
+    let (_bob_after, recovered) = bob_transport.decrypt(&datagram);
+    check(recovered? == b"after retry", || {
+        "the session derived via the retained clone must round-trip".to_owned()
+    })
 }
 
 #[test]

@@ -19,10 +19,16 @@ use libp2p_cat_types::{Error, UdpAddr};
 
 /// Default outbound payload ceiling, in bytes.
 ///
-/// Matches QUIC's initial-packet IPv6 minimum (1200) plus typical
-/// Ethernet headroom — well under any plausible path MTU.  Higher
-/// layers should fragment above this.
-pub const DEFAULT_MAX_DATAGRAM: usize = 1500;
+/// This is a UDP *payload* limit: IPv4 + UDP headers add 28 bytes
+/// (IPv6 + UDP add 48), so the payload ceiling must sit comfortably
+/// below the 1500-byte Ethernet MTU or maximum-size datagrams will
+/// IP-fragment, and fragmented UDP is widely dropped by middleboxes.
+/// 1200 matches QUIC's pre-PMTUD initial-packet clamp (RFC 9000
+/// section 14.1): conservative enough to survive common tunnel and
+/// VPN paths with reduced effective MTUs.  Higher layers must
+/// fragment above this; there is no path-MTU discovery in this
+/// crate.
+pub const DEFAULT_MAX_DATAGRAM: usize = 1200;
 
 /// Hard ceiling on the receive buffer, in bytes.
 ///

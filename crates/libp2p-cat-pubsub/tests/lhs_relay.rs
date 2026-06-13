@@ -133,7 +133,10 @@ fn build_mux(seed: u8, auth: Arc<LhsAuth>) -> Result<(LhsMux, UdpAddr), Error> {
     let keypair = StaticKeypair::from_private_bytes([seed; 32]);
     let identity = Ed25519Keypair::from_seed([seed.wrapping_add(1); 32]);
     Ok((
-        PubsubMux::new(Host::new(socket, keypair, &identity)?, auth),
+        PubsubMux::new(
+            Host::new(socket, keypair, &identity, [seed.wrapping_add(2); 32])?,
+            auth,
+        ),
         addr,
     ))
 }
@@ -147,6 +150,7 @@ fn expect_handshake_progress(ev: MuxEvent, expected_addr: UdpAddr) -> Result<(),
         | MuxEvent::PubsubAbsorbed { .. }
         | MuxEvent::PubsubDelivered { .. }
         | MuxEvent::PubsubRelayed { .. }
+        | MuxEvent::PubsubRedundant { .. }
         | MuxEvent::Rejected { .. }) => Err(Error::PubsubProtocol {
             reason: format!("expected HandshakeProgress({expected_addr}), got {other:?}"),
         }),
@@ -162,6 +166,7 @@ fn expect_handshake_complete(ev: MuxEvent, expected_addr: UdpAddr) -> Result<(),
         | MuxEvent::PubsubAbsorbed { .. }
         | MuxEvent::PubsubDelivered { .. }
         | MuxEvent::PubsubRelayed { .. }
+        | MuxEvent::PubsubRedundant { .. }
         | MuxEvent::Rejected { .. }) => Err(Error::PubsubProtocol {
             reason: format!("expected HandshakeComplete({expected_addr}), got {other:?}"),
         }),
@@ -177,6 +182,13 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(LhsMux, LhsMux), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
+    // Cookie round-trip then the three Noise messages.
+    let (responder, ev) = responder
+        .recv_one(responder_seed, unused_relay_rng())
+        .run()?;
+    expect_handshake_progress(ev, initiator_addr)?;
+    let (initiator, ev) = initiator.recv_one([0; 32], unused_relay_rng()).run()?;
+    expect_handshake_progress(ev, responder_addr)?;
     let (responder, ev) = responder
         .recv_one(responder_seed, unused_relay_rng())
         .run()?;
@@ -262,6 +274,7 @@ fn lhs_relay_decodes_at_downstream_with_public_only_relay() -> Result<(), Error>
             other @ (MuxEvent::PubsubRelayed { .. }
             | MuxEvent::PubsubAbsorbed { .. }
             | MuxEvent::PubsubDelivered { .. }
+            | MuxEvent::PubsubRedundant { .. }
             | MuxEvent::AppData { .. }
             | MuxEvent::HandshakeProgress { .. }
             | MuxEvent::HandshakeComplete { .. }
@@ -292,6 +305,7 @@ fn lhs_relay_decodes_at_downstream_with_public_only_relay() -> Result<(), Error>
                 other @ (MuxEvent::PubsubAbsorbed { .. }
                 | MuxEvent::PubsubDelivered { .. }
                 | MuxEvent::PubsubRelayed { .. }
+                | MuxEvent::PubsubRedundant { .. }
                 | MuxEvent::AppData { .. }
                 | MuxEvent::HandshakeProgress { .. }
                 | MuxEvent::HandshakeComplete { .. }
@@ -373,6 +387,7 @@ fn lhs_relay_rejects_pieces_from_a_different_generation() -> Result<(), Error> {
             | MuxEvent::PubsubAbsorbed { .. }
             | MuxEvent::PubsubDelivered { .. }
             | MuxEvent::PubsubRelayed { .. }
+            | MuxEvent::PubsubRedundant { .. }
             | MuxEvent::HandshakeProgress { .. }
             | MuxEvent::HandshakeComplete { .. }) => Err(Error::PubsubProtocol {
                 reason: format!(

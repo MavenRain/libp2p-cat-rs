@@ -82,6 +82,17 @@ pub enum MultiProtocolEvent {
         fanout_count: usize,
     },
 
+    /// A pubsub piece verified but was linearly dependent on pieces
+    /// this relay had already absorbed, so it was neither stored nor
+    /// re-broadcast (the relay rank gate; see
+    /// `libp2p_cat_pubsub::MuxEvent::PubsubRedundant`).
+    PubsubRedundant {
+        /// Source peer address.
+        addr: UdpAddr,
+        /// Topic the piece belonged to.
+        topic: Topic,
+    },
+
     /// A peer sent us a `PING` request.  We have already sent a
     /// `PING_RESP` back; this event is purely informational.
     KadPingRequestReceived {

@@ -105,6 +105,20 @@ pub enum MuxEvent {
         topic: Topic,
     },
 
+    /// A pubsub piece verified against its topic's commitment but
+    /// was linearly dependent on pieces this relay had already
+    /// absorbed, so it was neither stored nor re-broadcast.  The
+    /// rank gate bounds a relay to at most `piece_count` stored
+    /// pieces and `piece_count` recoded emissions per generation,
+    /// which terminates multi-relay circulation and bounds recoder
+    /// memory.
+    PubsubRedundant {
+        /// Source peer address.
+        addr: UdpAddr,
+        /// Topic the piece belonged to.
+        topic: Topic,
+    },
+
     /// A pubsub piece completed a topic decoder.  The reconstructed
     /// bytes are surfaced once; subsequent frames for the same topic
     /// require a fresh `register_topic` call.
@@ -868,6 +882,7 @@ where
         Some(entry) => {
             let RecoderEntry {
                 recoder,
+                rank_tracker,
                 commitment,
                 last_activity,
             } = entry;
@@ -878,6 +893,7 @@ where
                         topic.clone(),
                         RecoderEntry {
                             recoder,
+                            rank_tracker,
                             commitment,
                             last_activity,
                         },
@@ -898,73 +914,187 @@ where
                         },
                     ))
                 }
-                Ok(()) => match recoder.add_piece(wire_piece.piece()) {
-                    Err(e) => Io::pure((
+                // Fast path: once the relay's rank is full, every
+                // further verified piece is necessarily redundant, so
+                // skip the tracker clone and the full RREF that
+                // `absorb` would run.  Without this guard a flood of
+                // dependent pieces against a rank-full generation
+                // pays one matrix clone + RREF each, a needless
+                // per-packet cost.
+                Ok(()) if rank_tracker.is_complete() => {
+                    let next_tick = tick.wrapping_add(1);
+                    recoders.insert(
+                        topic.clone(),
+                        RecoderEntry {
+                            recoder,
+                            rank_tracker,
+                            commitment,
+                            last_activity: next_tick,
+                        },
+                    );
+                    Io::pure((
                         PubsubMux {
                             host,
                             state: PubsubState {
                                 auth,
                                 decoders,
                                 recoders,
-                                tick,
+                                tick: next_tick,
                             },
                         },
-                        MuxEvent::Rejected {
-                            addr,
-                            reason: format!("recoder add_piece failed: {e}"),
-                        },
-                    )),
-                    Ok(next_recoder) => {
-                        let piece_count = wire_piece.piece().coding_vector().len();
-                        let piece_byte_len = wire_piece.piece().data().len();
-                        let recode_io = next_recoder.recode_one(relay_rng);
+                        MuxEvent::PubsubRedundant { addr, topic },
+                    ))
+                }
+                // Rank gate: only a piece that increases the relay's
+                // observed rank is stored and re-broadcast, so a
+                // relay emits at most `piece_count` recoded pieces
+                // per generation and the recoder buffers at most
+                // `piece_count` pieces.  Without this, two relays in
+                // a connected graph re-amplify each other's recoded
+                // pieces until tick-driven eviction.
+                Ok(()) => match rank_tracker.clone().absorb(wire_piece.piece()) {
+                    Err(e) => {
+                        recoders.insert(
+                            topic.clone(),
+                            RecoderEntry {
+                                recoder,
+                                rank_tracker,
+                                commitment,
+                                last_activity,
+                            },
+                        );
+                        Io::pure((
+                            PubsubMux {
+                                host,
+                                state: PubsubState {
+                                    auth,
+                                    decoders,
+                                    recoders,
+                                    tick,
+                                },
+                            },
+                            MuxEvent::Rejected {
+                                addr,
+                                reason: format!("relay rank tracker absorb failed: {e}"),
+                            },
+                        ))
+                    }
+                    Ok(tracker) if tracker.useful_count() == rank_tracker.useful_count() => {
+                        // Linearly dependent: acknowledge but do
+                        // not store or relay.  Re-store the
+                        // pre-absorb tracker so dependent pieces
+                        // cannot grow the tracker matrix either.
                         let next_tick = tick.wrapping_add(1);
                         recoders.insert(
                             topic.clone(),
                             RecoderEntry {
-                                recoder: next_recoder,
-                                commitment: commitment.clone(),
+                                recoder,
+                                rank_tracker,
+                                commitment,
                                 last_activity: next_tick,
                             },
                         );
-                        let auth_for_tag = Arc::clone(&auth);
-                        recode_io
-                            .map_error(|e| Error::RlncLayer {
-                                reason: e.to_string(),
-                            })
-                            .flat_map(move |recoded: CodedPiece| {
-                                let tag = auth_for_tag.tag(&commitment, &recoded);
-                                let recoded_wire = WirePiece::<A>::new(commitment, recoded, tag);
-                                let frame_result = codec::encode::<A>(
-                                    &topic,
-                                    piece_count,
-                                    piece_byte_len,
-                                    &recoded_wire,
+                        Io::pure((
+                            PubsubMux {
+                                host,
+                                state: PubsubState {
+                                    auth,
+                                    decoders,
+                                    recoders,
+                                    tick: next_tick,
+                                },
+                            },
+                            MuxEvent::PubsubRedundant { addr, topic },
+                        ))
+                    }
+                    Ok(tracker) => {
+                        // Retain a copy so an add_piece failure
+                        // (unreachable in practice: the tracker
+                        // absorb already validated dimensions)
+                        // cannot lose the buffered pieces.
+                        let recoder_retained = recoder.clone();
+                        match recoder.add_piece(wire_piece.piece()) {
+                            Err(e) => {
+                                recoders.insert(
+                                    topic.clone(),
+                                    RecoderEntry {
+                                        recoder: recoder_retained,
+                                        rank_tracker,
+                                        commitment,
+                                        last_activity,
+                                    },
                                 );
-                                Io::suspend(move || frame_result).flat_map(move |frame| {
-                                    let mux = PubsubMux {
+                                Io::pure((
+                                    PubsubMux {
                                         host,
                                         state: PubsubState {
                                             auth,
                                             decoders,
                                             recoders,
-                                            tick: next_tick,
+                                            tick,
                                         },
-                                    };
-                                    send_frame_excluding(mux, &frame, addr).map(
-                                        move |(mux, fanout_count)| {
-                                            (
-                                                mux,
-                                                MuxEvent::PubsubRelayed {
-                                                    from: addr,
-                                                    topic,
-                                                    fanout_count,
+                                    },
+                                    MuxEvent::Rejected {
+                                        addr,
+                                        reason: format!("recoder add_piece failed: {e}"),
+                                    },
+                                ))
+                            }
+                            Ok(next_recoder) => {
+                                let piece_count = wire_piece.piece().coding_vector().len();
+                                let piece_byte_len = wire_piece.piece().data().len();
+                                let recode_io = next_recoder.recode_one(relay_rng);
+                                let next_tick = tick.wrapping_add(1);
+                                recoders.insert(
+                                    topic.clone(),
+                                    RecoderEntry {
+                                        recoder: next_recoder,
+                                        rank_tracker: tracker,
+                                        commitment: commitment.clone(),
+                                        last_activity: next_tick,
+                                    },
+                                );
+                                let auth_for_tag = Arc::clone(&auth);
+                                recode_io
+                                    .map_error(|e| Error::RlncLayer {
+                                        reason: e.to_string(),
+                                    })
+                                    .flat_map(move |recoded: CodedPiece| {
+                                        let tag = auth_for_tag.tag(&commitment, &recoded);
+                                        let recoded_wire =
+                                            WirePiece::<A>::new(commitment, recoded, tag);
+                                        let frame_result = codec::encode::<A>(
+                                            &topic,
+                                            piece_count,
+                                            piece_byte_len,
+                                            &recoded_wire,
+                                        );
+                                        Io::suspend(move || frame_result).flat_map(move |frame| {
+                                            let mux = PubsubMux {
+                                                host,
+                                                state: PubsubState {
+                                                    auth,
+                                                    decoders,
+                                                    recoders,
+                                                    tick: next_tick,
+                                                },
+                                            };
+                                            send_frame_excluding(mux, &frame, addr).map(
+                                                move |(mux, fanout_count)| {
+                                                    (
+                                                        mux,
+                                                        MuxEvent::PubsubRelayed {
+                                                            from: addr,
+                                                            topic,
+                                                            fanout_count,
+                                                        },
+                                                    )
                                                 },
                                             )
-                                        },
-                                    )
-                                })
-                            })
+                                        })
+                                    })
+                            }
+                        }
                     }
                 },
             }

@@ -110,51 +110,89 @@ impl TransportState {
     /// Decrypt a datagram, applying replay-window checks before and
     /// after the AEAD step.
     ///
-    /// # Errors
+    /// Always returns the transport state alongside the outcome.  On
+    /// failure the state is returned **unchanged**: an unauthenticated
+    /// datagram must not advance the replay window or otherwise
+    /// perturb the session, so a single corrupted, replayed, or
+    /// spoofed datagram costs the receiver nothing but the failed
+    /// decryption.  Callers keep the session alive and drop only the
+    /// offending datagram.
+    ///
+    /// The `Err` values surfaced in the second component are:
     ///
     /// - [`Error::NoiseProtocol`] if `datagram` is too short to even
     ///   contain a nonce prefix and an AEAD tag.
     /// - [`Error::NoiseReplay`] if the nonce is below the lower edge
     ///   of the replay window, or its window bit is already set.
     /// - [`Error::NoiseDecrypt`] if AEAD authentication fails.
-    pub fn decrypt(self, datagram: &[u8]) -> Result<(Self, Vec<u8>), Error> {
-        let total = datagram.len();
-        if total < TRANSPORT_OVERHEAD {
-            Err(Error::NoiseProtocol {
-                reason: format!(
-                    "transport datagram too short: {total} bytes, need at least {TRANSPORT_OVERHEAD}"
-                ),
-            })
-        } else {
-            let nonce_slice = datagram.get(0..TRANSPORT_NONCE_PREFIX_LEN).ok_or_else(|| {
-                Error::NoiseProtocol {
-                    reason: "missing nonce prefix".to_owned(),
-                }
-            })?;
-            let ciphertext =
-                datagram
-                    .get(TRANSPORT_NONCE_PREFIX_LEN..)
-                    .ok_or_else(|| Error::NoiseProtocol {
-                        reason: "missing ciphertext".to_owned(),
-                    })?;
-            let nonce_arr: [u8; TRANSPORT_NONCE_PREFIX_LEN] =
-                nonce_slice.try_into().map_err(|_| Error::NoiseProtocol {
-                    reason: "nonce prefix wrong length".to_owned(),
-                })?;
-            let nonce = u64::from_be_bytes(nonce_arr);
-            nonce_acceptable(self.recv_replay_window, self.recv_max_nonce, nonce)?;
-            let plaintext = aead_decrypt(&self.recv_key, nonce, &[], ciphertext)?;
-            let (new_window, new_max) =
-                advance_window(self.recv_replay_window, self.recv_max_nonce, nonce);
-            Ok((
-                Self {
-                    recv_max_nonce: new_max,
-                    recv_replay_window: new_window,
-                    ..self
+    pub fn decrypt(self, datagram: &[u8]) -> (Self, Result<Vec<u8>, Error>) {
+        let Self {
+            send_key,
+            send_nonce,
+            recv_key,
+            recv_max_nonce,
+            recv_replay_window,
+        } = self;
+        let (next_window, next_max, outcome) =
+            decrypt_checked(&recv_key, recv_replay_window, recv_max_nonce, datagram).map_or_else(
+                |e| (recv_replay_window, recv_max_nonce, Err(e)),
+                |(nonce, plaintext)| {
+                    let (new_window, new_max) =
+                        advance_window(recv_replay_window, recv_max_nonce, nonce);
+                    (new_window, new_max, Ok(plaintext))
                 },
-                plaintext,
-            ))
-        }
+            );
+        (
+            Self {
+                send_key,
+                send_nonce,
+                recv_key,
+                recv_max_nonce: next_max,
+                recv_replay_window: next_window,
+            },
+            outcome,
+        )
+    }
+}
+
+/// Borrow-only validation and decryption: length check, nonce parse,
+/// replay-window check, AEAD authentication.  Returns the accepted
+/// nonce and the plaintext; never touches the window state, so the
+/// caller applies [`advance_window`] only after full success.
+fn decrypt_checked(
+    recv_key: &[u8; KEY_LEN],
+    window: u64,
+    max_nonce: u64,
+    datagram: &[u8],
+) -> Result<(u64, Vec<u8>), Error> {
+    let total = datagram.len();
+    if total < TRANSPORT_OVERHEAD {
+        Err(Error::NoiseProtocol {
+            reason: format!(
+                "transport datagram too short: {total} bytes, need at least {TRANSPORT_OVERHEAD}"
+            ),
+        })
+    } else {
+        let nonce_slice =
+            datagram
+                .get(0..TRANSPORT_NONCE_PREFIX_LEN)
+                .ok_or_else(|| Error::NoiseProtocol {
+                    reason: "missing nonce prefix".to_owned(),
+                })?;
+        let ciphertext =
+            datagram
+                .get(TRANSPORT_NONCE_PREFIX_LEN..)
+                .ok_or_else(|| Error::NoiseProtocol {
+                    reason: "missing ciphertext".to_owned(),
+                })?;
+        let nonce_arr: [u8; TRANSPORT_NONCE_PREFIX_LEN] =
+            nonce_slice.try_into().map_err(|_| Error::NoiseProtocol {
+                reason: "nonce prefix wrong length".to_owned(),
+            })?;
+        let nonce = u64::from_be_bytes(nonce_arr);
+        nonce_acceptable(window, max_nonce, nonce)?;
+        let plaintext = aead_decrypt(recv_key, nonce, &[], ciphertext)?;
+        Ok((nonce, plaintext))
     }
 }
 

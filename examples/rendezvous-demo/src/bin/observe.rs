@@ -44,7 +44,7 @@ fn run() -> Result<(), Error> {
     let bound_addr = socket.local_addr()?;
     let static_kp = derive_static_keypair_from_bytes([0xA1; 32]);
     let identity = derive_identity_from_bytes([0x11; 32]);
-    let host = Host::new(socket, static_kp, &identity)?;
+    let host = Host::new(socket, static_kp, &identity, [0x4A; 32])?;
 
     writeln!(
         stdout(),
@@ -53,10 +53,13 @@ fn run() -> Result<(), Error> {
     )
     .map_err(Error::from)?;
 
-    // 1. Handshake with the server (Noise XX, initiator side).
+    // 1. Handshake with the server (Noise XX, initiator side).  The
+    //    handshake now opens with a stateless source-address-validation
+    //    cookie round-trip, so the initiator observes one or more
+    //    `HandshakeProgress` events before the terminal
+    //    `HandshakeComplete`.  Absorb the progress events.
     let host = host.dial(args.server, fresh_seed()?).run()?;
-    let (host, ev) = host.recv_one(fresh_seed()?).run()?;
-    let _remote_peer_id = expect_handshake_complete(ev, args.server)?;
+    let (host, _remote_peer_id) = drive_handshake_to_completion(host, args.server)?;
 
     // 2. Wrap the established Host in a RendezvousNode, then call
     //    observe_self to query the server for our observed address.
@@ -93,16 +96,23 @@ fn parse_addr(s: &str) -> Result<UdpAddr, Error> {
         })
 }
 
-fn expect_handshake_complete(
-    ev: HostEvent,
+/// Step `recv_one` until the handshake with `expected` reports
+/// `HandshakeComplete`, absorbing any intermediate
+/// `HandshakeProgress` events emitted by the cookie round-trip.
+fn drive_handshake_to_completion(
+    host: Host,
     expected: UdpAddr,
-) -> Result<libp2p_cat_rs::PeerId, Error> {
+) -> Result<(Host, libp2p_cat_rs::PeerId), Error> {
+    let (host, ev) = host.recv_one(fresh_seed()?).run()?;
     match ev {
         HostEvent::HandshakeComplete {
             addr,
             remote_peer_id,
             ..
-        } if addr == expected => Ok(remote_peer_id),
+        } if addr == expected => Ok((host, remote_peer_id)),
+        HostEvent::HandshakeProgress { addr } if addr == expected => {
+            drive_handshake_to_completion(host, expected)
+        }
         other @ (HostEvent::HandshakeProgress { .. }
         | HostEvent::HandshakeComplete { .. }
         | HostEvent::DatagramDelivered { .. }

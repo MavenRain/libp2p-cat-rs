@@ -32,21 +32,24 @@ use libp2p_cat_types::{Error, PeerId, UdpAddr};
 use libp2p_cat_udp::UdpTransport;
 
 use crate::capacity::Capacity;
+use crate::cookie;
 use crate::event::HostEvent;
 use crate::state::{EstablishedConnection, HandshakeState, InFlightHandshake};
 
 /// Long-lived identity bundle: the X25519 keypair Noise runs against,
 /// the precomputed Ed25519 [`SignedStaticKey`] this host sends as the
-/// XX handshake trailer, and the libp2p-compatible [`PeerId`] that
-/// binding resolves to.
+/// XX handshake trailer, the libp2p-compatible [`PeerId`] that
+/// binding resolves to, and the secret keying the stateless
+/// source-address-validation cookies (see [`crate::cookie`]).
 ///
-/// Cloned cheaply on every event-loop step; the X25519 private key is
-/// the only secret material it carries.
+/// Cloned cheaply on every event-loop step; the X25519 private key
+/// and the cookie secret are the only secret material it carries.
 #[derive(Clone)]
 struct HostIdentity {
     static_keypair: StaticKeypair,
     signed_static_key: SignedStaticKey,
     peer_id: PeerId,
+    cookie_secret: [u8; 32],
 }
 
 /// Connection-managing host.
@@ -76,6 +79,12 @@ impl Host {
     /// construction.  The caller can keep their own copy of the
     /// keypair if they need to sign other things later.
     ///
+    /// `cookie_secret` is 32 bytes that the caller has sourced from a
+    /// cryptographically secure RNG (the same caller-provides-entropy
+    /// contract as the per-call ephemeral seeds).  It keys the
+    /// stateless source-address-validation cookies this host mints
+    /// when answering a bare `msg1`; see [`crate::cookie`].
+    ///
     /// # Errors
     ///
     /// - [`Error::IdentityVerify`] if the underlying Ed25519
@@ -87,12 +96,21 @@ impl Host {
         socket: UdpTransport,
         static_keypair: StaticKeypair,
         identity: &Ed25519Keypair,
+        cookie_secret: [u8; 32],
     ) -> Result<Self, Error> {
-        Self::with_capacity(socket, static_keypair, identity, Capacity::default())
+        Self::with_capacity(
+            socket,
+            static_keypair,
+            identity,
+            cookie_secret,
+            Capacity::default(),
+        )
     }
 
     /// Build a host with an explicit [`Capacity`] for both the
     /// in-flight handshake and established-connection tables.
+    ///
+    /// `cookie_secret` follows the [`Self::new`] contract.
     ///
     /// # Errors
     ///
@@ -102,6 +120,7 @@ impl Host {
         socket: UdpTransport,
         static_keypair: StaticKeypair,
         identity: &Ed25519Keypair,
+        cookie_secret: [u8; 32],
         capacity: Capacity,
     ) -> Result<Self, Error> {
         let signed_static_key = SignedStaticKey::create(identity, static_keypair.public())?;
@@ -112,6 +131,7 @@ impl Host {
                 static_keypair,
                 signed_static_key,
                 peer_id,
+                cookie_secret,
             },
             handshakes: BTreeMap::new(),
             established: BTreeMap::new(),
@@ -231,10 +251,14 @@ impl Host {
                 after_e,
                 msg1,
             } = prepared;
+            let msg1_retained = msg1.clone();
             socket.send(addr, msg1).map(move |socket| {
                 let next_tick = tick.wrapping_add(1);
                 let entry = InFlightHandshake {
-                    state: HandshakeState::InitiatorAwaitingResponse(after_e),
+                    state: HandshakeState::InitiatorAwaitingResponse {
+                        after_e,
+                        msg1: msg1_retained,
+                    },
                     last_activity: next_tick,
                 };
                 let handshakes = insert_handshake_with_lru(
@@ -306,8 +330,10 @@ impl Host {
     /// undersized "punch" datagram at a NAT to open the mapping
     /// without starting a handshake.  Receivers see such datagrams
     /// as [`HostEvent::Rejected`] (the dispatcher's
-    /// `try_responder_msg1` path rejects anything that is not a
-    /// `MESSAGE_1_LEN`-byte handshake).
+    /// `try_responder_msg1` path rejects anything that is neither a
+    /// bare `msg1` nor a `msg1 || cookie`; callers should keep punch
+    /// datagrams away from those two lengths so they are not
+    /// mistaken for handshake traffic).
     ///
     /// # Errors
     ///
@@ -335,8 +361,10 @@ impl Host {
     /// Receive one datagram and dispatch it.
     ///
     /// `ephemeral_seed` is consumed only if the inbound datagram is a
-    /// fresh `msg1` from a previously-unknown peer (the host
-    /// immediately writes `msg2` in response).
+    /// cookie-validated `msg1 || cookie` from a previously-unknown
+    /// peer (the host then writes `msg2` in response).  A bare
+    /// `msg1` is answered with a stateless cookie challenge that
+    /// consumes no seed and creates no state; see [`crate::cookie`].
     ///
     /// # Errors
     ///
@@ -344,7 +372,10 @@ impl Host {
     /// problems (decrypt failures, malformed handshakes, replays,
     /// out-of-state datagrams, identity-binding rejection) surface as
     /// [`HostEvent::Rejected`] rather than `Err`, so a long-running
-    /// loop survives misbehaving peers.
+    /// loop survives misbehaving peers.  Neither a failed transport
+    /// decrypt nor a failed handshake advance tears down the
+    /// corresponding state: a single corrupted or spoofed datagram
+    /// costs only itself.
     #[must_use]
     pub fn recv_one(self, ephemeral_seed: [u8; 32]) -> Io<Error, (Self, HostEvent)> {
         let Self {
@@ -596,59 +627,67 @@ fn decrypt_established(
         reason: "established entry vanished mid-dispatch".to_owned(),
     });
     Io::suspend(move || conn).map(move |conn| {
-        let outcome = conn.transport.decrypt(&datagram);
-        let remote_static = conn.remote_static;
-        let remote_peer_id = conn.remote_peer_id;
+        let EstablishedConnection {
+            transport,
+            remote_static,
+            remote_peer_id,
+            last_activity,
+        } = conn;
+        // `decrypt` returns the transport state unchanged on failure,
+        // so the session survives corrupted, replayed, and spoofed
+        // datagrams: an off-path attacker can no longer reset an
+        // established connection with a single junk packet.  A
+        // rejected datagram refreshes neither this entry's
+        // `last_activity` NOR the host's monotonic `tick`, so a junk
+        // flood from a spoofed source can neither keep an idle
+        // connection alive nor advance the logical clock to
+        // prematurely idle-evict other live-but-quiet connections.
+        let (transport, outcome) = transport.decrypt(&datagram);
         let next_tick = tick.wrapping_add(1);
-        match outcome {
-            Ok((transport, plaintext)) => {
-                established.insert(
-                    from,
-                    EstablishedConnection {
-                        transport,
-                        remote_static,
-                        remote_peer_id,
-                        last_activity: next_tick,
-                    },
-                );
+        let (entry_activity, host_tick, event) = outcome.map_or_else(
+            |e| {
                 (
-                    rebuild_host(
-                        socket,
-                        identity,
-                        handshakes,
-                        established,
-                        capacity,
-                        next_tick,
-                    ),
+                    last_activity,
+                    tick,
+                    HostEvent::Rejected {
+                        addr: from,
+                        reason: format!(
+                            "transport decrypt failed: {e}; datagram dropped, connection kept"
+                        ),
+                    },
+                )
+            },
+            |plaintext| {
+                (
+                    next_tick,
+                    next_tick,
                     HostEvent::DatagramDelivered {
                         addr: from,
                         plaintext,
                     },
                 )
-            }
-            Err(e) => {
-                // V1 policy: drop the connection on tamper / replay.
-                // The transport state was consumed by `decrypt`, so
-                // we cannot keep using it without a rollback that the
-                // current API doesn't expose.  A future iteration can
-                // expose a non-consuming `peek_decrypt` to keep the
-                // session alive across single bad datagrams.
-                (
-                    rebuild_host(
-                        socket,
-                        identity,
-                        handshakes,
-                        established,
-                        capacity,
-                        next_tick,
-                    ),
-                    HostEvent::Rejected {
-                        addr: from,
-                        reason: format!("transport decrypt failed: {e}; connection dropped"),
-                    },
-                )
-            }
-        }
+            },
+        );
+        established.insert(
+            from,
+            EstablishedConnection {
+                transport,
+                remote_static,
+                remote_peer_id,
+                last_activity: entry_activity,
+            },
+        );
+        (
+            rebuild_host(
+                socket,
+                identity,
+                handshakes,
+                established,
+                capacity,
+                host_tick,
+            ),
+            event,
+        )
     })
 }
 
@@ -666,29 +705,100 @@ fn advance_in_flight(
     let removed = handshakes.remove(&from).ok_or_else(|| Error::HostState {
         reason: "in-flight entry vanished mid-dispatch".to_owned(),
     });
-    Io::suspend(move || removed).flat_map(move |entry| match entry.state {
-        HandshakeState::InitiatorAwaitingResponse(after_e) => initiator_consume_msg2(
-            socket,
-            identity,
-            handshakes,
-            established,
-            capacity,
-            tick,
-            from,
-            after_e,
-            &datagram,
-        ),
-        HandshakeState::ResponderAwaitingFinalize(after_resp) => responder_consume_msg3(
-            socket,
-            identity,
-            handshakes,
-            established,
-            capacity,
-            tick,
-            from,
-            after_resp,
-            &datagram,
-        ),
+    Io::suspend(move || removed).flat_map(move |entry| {
+        let InFlightHandshake {
+            state,
+            last_activity,
+        } = entry;
+        match state {
+            HandshakeState::InitiatorAwaitingResponse { after_e, msg1 } => {
+                if cookie::is_challenge(&datagram) {
+                    answer_cookie_challenge(
+                        socket,
+                        identity,
+                        handshakes,
+                        established,
+                        capacity,
+                        tick,
+                        from,
+                        after_e,
+                        msg1,
+                        last_activity,
+                        &datagram,
+                    )
+                } else {
+                    initiator_consume_msg2(
+                        socket,
+                        identity,
+                        handshakes,
+                        established,
+                        capacity,
+                        tick,
+                        from,
+                        after_e,
+                        msg1,
+                        last_activity,
+                        &datagram,
+                    )
+                }
+            }
+            HandshakeState::ResponderAwaitingFinalize(after_resp) => responder_consume_msg3(
+                socket,
+                identity,
+                handshakes,
+                established,
+                capacity,
+                tick,
+                from,
+                after_resp,
+                last_activity,
+                &datagram,
+            ),
+        }
+    })
+}
+
+/// Answer a responder's stateless cookie challenge by re-sending the
+/// retained `msg1` with the cookie MAC appended.  The handshake
+/// state is unchanged (the cookie exchange is invisible to the Noise
+/// transcript).
+///
+/// A cookie challenge is unauthenticated to the initiator, so a
+/// spoofed one (from an attacker that knows the dialed peer's
+/// address) can reach this path.  To deny that any leverage, neither
+/// the entry's `last_activity` nor the host's `tick` advances here:
+/// the handshake ages from its dial time regardless of cookie
+/// chatter, so a spoofed-challenge flood can neither pin a stale
+/// dial alive nor perturb the eviction clock.  A genuine handshake
+/// still completes well within the idle window in its normal two
+/// round trips.
+#[allow(clippy::too_many_arguments)]
+fn answer_cookie_challenge(
+    socket: UdpTransport,
+    identity: HostIdentity,
+    handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
+    established: BTreeMap<UdpAddr, EstablishedConnection>,
+    capacity: Capacity,
+    tick: u64,
+    from: UdpAddr,
+    after_e: libp2p_cat_noise::InitiatorAfterE,
+    msg1: Vec<u8>,
+    last_activity: u64,
+    datagram: &[u8],
+) -> Io<Error, (Host, HostEvent)> {
+    let mac = datagram.get(1..).map(<[u8]>::to_vec).unwrap_or_default();
+    let msg1_with_cookie: Vec<u8> = msg1.iter().copied().chain(mac).collect();
+    socket.send(from, msg1_with_cookie).map(move |socket| {
+        let entry = InFlightHandshake {
+            state: HandshakeState::InitiatorAwaitingResponse { after_e, msg1 },
+            last_activity,
+        };
+        let handshakes =
+            insert_handshake_with_lru(handshakes, from, entry, capacity.max_handshakes_in_flight());
+        (
+            rebuild_host(socket, identity, handshakes, established, capacity, tick),
+            HostEvent::HandshakeProgress { addr: from },
+        )
     })
 }
 
@@ -702,8 +812,16 @@ fn initiator_consume_msg2(
     tick: u64,
     from: UdpAddr,
     after_e: libp2p_cat_noise::InitiatorAfterE,
+    msg1: Vec<u8>,
+    last_activity: u64,
     datagram: &[u8],
 ) -> Io<Error, (Host, HostEvent)> {
+    // Retain a copy of the awaiting state: if the datagram fails to
+    // advance the handshake (corrupted, spoofed, or out-of-state), the
+    // entry is re-stored so a later genuine msg2 can still complete.
+    // The failed attempt emitted nothing on the wire, so the retained
+    // copy can never reuse a nonce.
+    let retained = after_e.clone();
     let result = after_e
         .read_response(datagram)
         .and_then(|(after_resp, msg2_payload)| {
@@ -749,20 +867,35 @@ fn initiator_consume_msg2(
                 )
             })
         }
-        Err(e) => Io::pure((
-            rebuild_host(
-                socket,
-                identity,
+        Err(e) => {
+            let entry = InFlightHandshake {
+                state: HandshakeState::InitiatorAwaitingResponse {
+                    after_e: retained,
+                    msg1,
+                },
+                last_activity,
+            };
+            let handshakes = insert_handshake_with_lru(
                 handshakes,
-                established,
-                capacity,
-                next_tick,
-            ),
-            HostEvent::Rejected {
-                addr: from,
-                reason: format!("initiator: failed to advance on msg2: {e}"),
-            },
-        )),
+                from,
+                entry,
+                capacity.max_handshakes_in_flight(),
+            );
+            Io::pure((
+                rebuild_host(
+                    socket,
+                    identity,
+                    handshakes,
+                    established,
+                    capacity,
+                    next_tick,
+                ),
+                HostEvent::Rejected {
+                    addr: from,
+                    reason: format!("initiator: failed to advance on msg2: {e}; handshake kept"),
+                },
+            ))
+        }
     }
 }
 
@@ -776,8 +909,13 @@ fn responder_consume_msg3(
     tick: u64,
     from: UdpAddr,
     after_resp: libp2p_cat_noise::ResponderAfterResponse,
+    last_activity: u64,
     datagram: &[u8],
 ) -> Io<Error, (Host, HostEvent)> {
+    // Retain a copy of the awaiting state so a corrupted or spoofed
+    // datagram cannot kill the in-flight handshake; see the matching
+    // note in `initiator_consume_msg2`.
+    let retained = after_resp.clone();
     let outcome =
         after_resp
             .read_s(datagram)
@@ -812,20 +950,32 @@ fn responder_consume_msg3(
                 },
             ))
         }
-        Err(e) => Io::pure((
-            rebuild_host(
-                socket,
-                identity,
+        Err(e) => {
+            let entry = InFlightHandshake {
+                state: HandshakeState::ResponderAwaitingFinalize(retained),
+                last_activity,
+            };
+            let handshakes = insert_handshake_with_lru(
                 handshakes,
-                established,
-                capacity,
-                next_tick,
-            ),
-            HostEvent::Rejected {
-                addr: from,
-                reason: format!("responder: failed to finalize on msg3: {e}"),
-            },
-        )),
+                from,
+                entry,
+                capacity.max_handshakes_in_flight(),
+            );
+            Io::pure((
+                rebuild_host(
+                    socket,
+                    identity,
+                    handshakes,
+                    established,
+                    capacity,
+                    next_tick,
+                ),
+                HostEvent::Rejected {
+                    addr: from,
+                    reason: format!("responder: failed to finalize on msg3: {e}; handshake kept"),
+                },
+            ))
+        }
     }
 }
 
@@ -842,24 +992,16 @@ fn try_responder_msg1(
     ephemeral_seed: [u8; 32],
 ) -> Io<Error, (Host, HostEvent)> {
     let next_tick = tick.wrapping_add(1);
-    if datagram.len() == MESSAGE_1_LEN {
-        let responder = Responder::new(identity.static_keypair.clone());
-        let trailer = identity.signed_static_key.to_bytes();
-        match responder
-            .read_e(datagram)
-            .and_then(|after_e| after_e.write_response(ephemeral_seed, &trailer))
-        {
-            Ok((after_resp, msg2)) => socket.send(from, msg2).map(move |socket| {
-                let entry = InFlightHandshake {
-                    state: HandshakeState::ResponderAwaitingFinalize(after_resp),
-                    last_activity: next_tick,
-                };
-                let handshakes = insert_handshake_with_lru(
-                    handshakes,
-                    from,
-                    entry,
-                    capacity.max_handshakes_in_flight(),
-                );
+    match () {
+        // A bare msg1 proves nothing about its source address, so it
+        // is answered with a stateless cookie challenge: no handshake
+        // state, no Diffie-Hellman, and a reply barely larger than
+        // the datagram that elicited it.  Spoofed-source floods cost
+        // this host one small send each and cannot flush the
+        // handshake table (see `crate::cookie`).
+        () if datagram.len() == MESSAGE_1_LEN => {
+            let reply = cookie::challenge(&identity.cookie_secret, from, datagram);
+            socket.send(from, reply).map(move |socket| {
                 (
                     rebuild_host(
                         socket,
@@ -871,24 +1013,44 @@ fn try_responder_msg1(
                     ),
                     HostEvent::HandshakeProgress { addr: from },
                 )
-            }),
-            Err(e) => Io::pure((
-                rebuild_host(
+            })
+        }
+        // msg1 with an echoed cookie: verify statelessly, then spend
+        // the DH work and handshake-table slot only on a source that
+        // has proven it can receive at its claimed address.
+        () if datagram.len() == cookie::MSG1_WITH_COOKIE_LEN => {
+            let e_bytes = datagram.get(..MESSAGE_1_LEN).unwrap_or(&[]);
+            let mac = datagram.get(MESSAGE_1_LEN..).unwrap_or(&[]);
+            if cookie::verify(&identity.cookie_secret, from, e_bytes, mac) {
+                respond_to_validated_msg1(
                     socket,
                     identity,
                     handshakes,
                     established,
                     capacity,
-                    next_tick,
-                ),
-                HostEvent::Rejected {
-                    addr: from,
-                    reason: format!("responder: failed to start handshake: {e}"),
-                },
-            )),
+                    tick,
+                    from,
+                    e_bytes,
+                    ephemeral_seed,
+                )
+            } else {
+                Io::pure((
+                    rebuild_host(
+                        socket,
+                        identity,
+                        handshakes,
+                        established,
+                        capacity,
+                        next_tick,
+                    ),
+                    HostEvent::Rejected {
+                        addr: from,
+                        reason: "msg1 cookie failed verification".to_owned(),
+                    },
+                ))
+            }
         }
-    } else {
-        Io::pure((
+        () => Io::pure((
             rebuild_host(
                 socket,
                 identity,
@@ -900,11 +1062,74 @@ fn try_responder_msg1(
             HostEvent::Rejected {
                 addr: from,
                 reason: format!(
-                    "datagram from new peer is not a {MESSAGE_1_LEN}-byte handshake msg1: {} bytes",
+                    "datagram from new peer is neither a {MESSAGE_1_LEN}-byte bare msg1 nor a {}-byte msg1-with-cookie: {} bytes",
+                    cookie::MSG1_WITH_COOKIE_LEN,
                     datagram.len()
                 ),
             },
-        ))
+        )),
+    }
+}
+
+/// The original responder flow, reached only after the source
+/// address passed cookie verification: read `e`, perform the DH
+/// work, write `msg2`, and store the awaiting-finalize state.
+#[allow(clippy::too_many_arguments)]
+fn respond_to_validated_msg1(
+    socket: UdpTransport,
+    identity: HostIdentity,
+    handshakes: BTreeMap<UdpAddr, InFlightHandshake>,
+    established: BTreeMap<UdpAddr, EstablishedConnection>,
+    capacity: Capacity,
+    tick: u64,
+    from: UdpAddr,
+    e_bytes: &[u8],
+    ephemeral_seed: [u8; 32],
+) -> Io<Error, (Host, HostEvent)> {
+    let next_tick = tick.wrapping_add(1);
+    let responder = Responder::new(identity.static_keypair.clone());
+    let trailer = identity.signed_static_key.to_bytes();
+    match responder
+        .read_e(e_bytes)
+        .and_then(|after_e| after_e.write_response(ephemeral_seed, &trailer))
+    {
+        Ok((after_resp, msg2)) => socket.send(from, msg2).map(move |socket| {
+            let entry = InFlightHandshake {
+                state: HandshakeState::ResponderAwaitingFinalize(after_resp),
+                last_activity: next_tick,
+            };
+            let handshakes = insert_handshake_with_lru(
+                handshakes,
+                from,
+                entry,
+                capacity.max_handshakes_in_flight(),
+            );
+            (
+                rebuild_host(
+                    socket,
+                    identity,
+                    handshakes,
+                    established,
+                    capacity,
+                    next_tick,
+                ),
+                HostEvent::HandshakeProgress { addr: from },
+            )
+        }),
+        Err(e) => Io::pure((
+            rebuild_host(
+                socket,
+                identity,
+                handshakes,
+                established,
+                capacity,
+                next_tick,
+            ),
+            HostEvent::Rejected {
+                addr: from,
+                reason: format!("responder: failed to start handshake: {e}"),
+            },
+        )),
     }
 }
 

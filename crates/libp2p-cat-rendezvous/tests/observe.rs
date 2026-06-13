@@ -38,7 +38,7 @@ fn build_node(static_seed: u8, identity_seed: u8) -> Result<(RendezvousNode, Udp
     let addr = socket.local_addr()?;
     let static_kp = StaticKeypair::from_private_bytes([static_seed; 32]);
     let identity = Ed25519Keypair::from_seed([identity_seed; 32]);
-    let host = Host::new(socket, static_kp, &identity)?;
+    let host = Host::new(socket, static_kp, &identity, [0x4A; 32])?;
     Ok((RendezvousNode::new(host), addr))
 }
 
@@ -87,10 +87,19 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(RendezvousNode, RendezvousNode), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
-    let (responder, ev_progress) = responder.recv_one(responder_seed).run()?;
-    expect_progress(ev_progress, initiator_addr)?;
+    // step1: responder answers bare msg1 with a cookie challenge (no state created).
+    let (responder, ev_progress1) = responder.recv_one(responder_seed).run()?;
+    expect_progress(ev_progress1, initiator_addr)?;
+    // step2: initiator echoes the cookie (re-sends msg1||cookie).
+    let (initiator, ev_progress2) = initiator.recv_one([0; 32]).run()?;
+    expect_progress(ev_progress2, responder_addr)?;
+    // step3: responder validates the cookie, consumes msg1, writes msg2.
+    let (responder, ev_progress3) = responder.recv_one(responder_seed).run()?;
+    expect_progress(ev_progress3, initiator_addr)?;
+    // step4: initiator consumes msg2, writes msg3.
     let (initiator, ev_initiator) = initiator.recv_one([0; 32]).run()?;
     expect_complete(ev_initiator, responder_addr)?;
+    // step5: responder consumes msg3.
     let (responder, ev_responder) = responder.recv_one([0; 32]).run()?;
     expect_complete(ev_responder, initiator_addr)?;
     Ok((initiator, responder))

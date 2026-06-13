@@ -42,7 +42,7 @@ fn run() -> Result<(), Error> {
     let bound_addr = socket.local_addr()?;
     let static_kp = derive_static_keypair(bind);
     let identity = derive_identity(bind);
-    let host = Host::new(socket, static_kp, &identity)?;
+    let host = Host::new(socket, static_kp, &identity, [0x4A; 32])?;
     let node = RendezvousNode::new(host);
 
     writeln!(

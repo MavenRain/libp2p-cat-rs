@@ -30,7 +30,7 @@ fn build_host(seed: u8, capacity: Capacity) -> Result<(Host, UdpAddr), Error> {
     let addr = socket.local_addr()?;
     let kp = StaticKeypair::from_private_bytes([seed; 32]);
     let id = Ed25519Keypair::from_seed([seed.wrapping_add(1); 32]);
-    let host = Host::with_capacity(socket, kp, &id, capacity)?;
+    let host = Host::with_capacity(socket, kp, &id, [seed.wrapping_add(2); 32], capacity)?;
     Ok((host, addr))
 }
 
@@ -38,8 +38,8 @@ fn build_host_default(seed: u8) -> Result<(Host, UdpAddr), Error> {
     build_host(seed, Capacity::default())
 }
 
-/// Drive a single Noise XX handshake to completion between two
-/// hosts over real UDP datagrams.
+/// Drive a single Noise XX handshake (including the cookie round
+/// trip) to completion between two hosts over real UDP datagrams.
 fn handshake_pair(
     initiator: Host,
     responder: Host,
@@ -47,6 +47,10 @@ fn handshake_pair(
     responder_addr: UdpAddr,
 ) -> Result<(Host, Host), Error> {
     let initiator = initiator.dial(responder_addr, [0x44; 32]).run()?;
+    let (responder, ev) = responder.recv_one([0x55; 32]).run()?;
+    expect_handshake_progress(ev, initiator_addr)?;
+    let (initiator, ev) = initiator.recv_one([0; 32]).run()?;
+    expect_handshake_progress(ev, responder_addr)?;
     let (responder, ev) = responder.recv_one([0x55; 32]).run()?;
     expect_handshake_progress(ev, initiator_addr)?;
     let (initiator, ev) = initiator.recv_one([0; 32]).run()?;

@@ -119,6 +119,12 @@ impl Initiator {
 }
 
 /// Initiator state after sending message 1, awaiting message 2.
+///
+/// `Clone` exists so a host can retain a copy across a failed
+/// consuming transition (see `SymmetricState`'s Clone note): reading
+/// message 2 performs no encryption, so retrying from the retained
+/// copy can never reuse a nonce.
+#[derive(Clone)]
 #[must_use]
 pub struct InitiatorAfterE {
     static_keypair: StaticKeypair,
@@ -338,6 +344,12 @@ impl ResponderAfterE {
 }
 
 /// Responder state after writing message 2, awaiting message 3.
+///
+/// `Clone` exists so a host can retain a copy across a failed
+/// consuming transition (see `SymmetricState`'s Clone note): reading
+/// message 3 performs no encryption, so retrying from the retained
+/// copy can never reuse a nonce.
+#[derive(Clone)]
 #[must_use]
 pub struct ResponderAfterResponse {
     eph_private: EphemeralPrivateKey,

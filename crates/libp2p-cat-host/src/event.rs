@@ -14,9 +14,12 @@ use libp2p_cat_types::{PeerId, UdpAddr};
 #[must_use]
 pub enum HostEvent {
     /// A handshake step succeeded but the connection is not yet
-    /// established.  Either we just sent `msg2` in response to a
-    /// fresh `msg1`, or we just sent `msg3` and are waiting on the
-    /// peer to confirm receipt by sending us a transport datagram.
+    /// established.  One of: we answered a bare `msg1` with a
+    /// stateless cookie challenge, we answered a cookie challenge by
+    /// re-sending `msg1 || cookie`, we sent `msg2` in response to a
+    /// cookie-validated `msg1`, or we sent `msg3` and are waiting on
+    /// the peer to confirm receipt by sending us a transport
+    /// datagram.
     HandshakeProgress {
         /// Address of the peer the handshake is with.
         addr: UdpAddr,

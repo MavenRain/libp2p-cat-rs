@@ -35,7 +35,7 @@ fn build_node(static_seed: u8, identity_seed: u8) -> Result<(KademliaNode, UdpAd
     let addr = socket.local_addr()?;
     let static_kp = StaticKeypair::from_private_bytes([static_seed; 32]);
     let identity = Ed25519Keypair::from_seed([identity_seed; 32]);
-    let host = Host::new(socket, static_kp, &identity)?;
+    let host = Host::new(socket, static_kp, &identity, [0x4A; 32])?;
     Ok((KademliaNode::new(host, 20), addr))
 }
 
@@ -82,10 +82,19 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(KademliaNode, KademliaNode, NodeId, NodeId), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
+    // step1: responder answers bare msg1 with a cookie challenge (no state created).
+    let (responder, ev_cookie_challenge) = responder.recv_one(responder_seed).run()?;
+    expect_progress(ev_cookie_challenge, initiator_addr)?;
+    // step2: initiator echoes the cookie (re-sends msg1||cookie).
+    let (initiator, ev_cookie_echo) = initiator.recv_one([0; 32]).run()?;
+    expect_progress(ev_cookie_echo, responder_addr)?;
+    // step3: responder validates the cookie, consumes msg1, writes msg2.
     let (responder, ev_progress) = responder.recv_one(responder_seed).run()?;
     expect_progress(ev_progress, initiator_addr)?;
+    // step4: initiator consumes msg2, writes msg3 (observes responder's node id).
     let (initiator, ev_initiator_complete) = initiator.recv_one([0; 32]).run()?;
     let initiator_observed_responder_id = expect_complete(ev_initiator_complete, responder_addr)?;
+    // step5: responder consumes msg3 (observes initiator's node id).
     let (responder, ev_responder_complete) = responder.recv_one([0; 32]).run()?;
     let responder_observed_initiator_id = expect_complete(ev_responder_complete, initiator_addr)?;
     Ok((

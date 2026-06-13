@@ -58,7 +58,7 @@ fn run() -> Result<(), Error> {
     let socket = UdpTransport::bind(bind).run()?;
     let keypair = derive_keypair(bind);
     let identity = derive_identity(bind);
-    let host = Host::new(socket, keypair, &identity)?;
+    let host = Host::new(socket, keypair, &identity, [0x4A; 32])?;
 
     print_banner(bind, args.peer.as_ref(), host.peer_id())?;
 
@@ -152,23 +152,12 @@ fn print_banner(bind: UdpAddr, peer: Option<&UdpAddr>, peer_id: &PeerId) -> Resu
 
 fn initiator_handshake(host: Host, peer: UdpAddr) -> Result<Host, Error> {
     let host = host.dial(peer, fresh_seed()?).run()?;
-    let (host, ev) = host.recv_one(fresh_seed()?).run()?;
-    match ev {
-        HostEvent::HandshakeComplete {
-            addr,
-            remote_static,
-            remote_peer_id,
-        } if addr == peer => {
-            announce_handshake(&remote_static, &remote_peer_id)?;
-            Ok(host)
-        }
-        other @ (HostEvent::HandshakeProgress { .. }
-        | HostEvent::HandshakeComplete { .. }
-        | HostEvent::DatagramDelivered { .. }
-        | HostEvent::Rejected { .. }) => Err(Error::HostState {
-            reason: format!("expected HandshakeComplete from {peer}, got {other:?}"),
-        }),
-    }
+    // The Noise XX handshake now opens with a stateless
+    // source-address-validation cookie round-trip, so the initiator
+    // observes one or more `HandshakeProgress` events (echoing the
+    // cookie) before the terminal `HandshakeComplete`.  Absorb the
+    // progress events until the handshake completes.
+    drive_handshake_to_completion(host, peer)
 }
 
 fn responder_handshake(host: Host) -> Result<(Host, UdpAddr), Error> {
@@ -181,15 +170,29 @@ fn responder_handshake(host: Host) -> Result<(Host, UdpAddr), Error> {
             reason: format!("expected HandshakeProgress, got {other:?}"),
         }),
     }?;
-    let (host, ev2) = host.recv_one(fresh_seed()?).run()?;
-    match ev2 {
+    // After the initial cookie challenge the responder validates the
+    // echoed cookie (another `HandshakeProgress`) before writing msg2
+    // and finally observing `HandshakeComplete`.  Recurse over the
+    // intermediate progress events until completion.
+    drive_handshake_to_completion(host, peer).map(|host| (host, peer))
+}
+
+/// Step `recv_one` until the handshake with `peer` reports
+/// `HandshakeComplete`, absorbing any intermediate
+/// `HandshakeProgress` events emitted by the cookie round-trip.
+fn drive_handshake_to_completion(host: Host, peer: UdpAddr) -> Result<Host, Error> {
+    let (host, ev) = host.recv_one(fresh_seed()?).run()?;
+    match ev {
         HostEvent::HandshakeComplete {
             addr,
             remote_static,
             remote_peer_id,
         } if addr == peer => {
             announce_handshake(&remote_static, &remote_peer_id)?;
-            Ok((host, peer))
+            Ok(host)
+        }
+        HostEvent::HandshakeProgress { addr } if addr == peer => {
+            drive_handshake_to_completion(host, peer)
         }
         other @ (HostEvent::HandshakeProgress { .. }
         | HostEvent::HandshakeComplete { .. }

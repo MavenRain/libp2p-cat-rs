@@ -61,7 +61,11 @@ fn build_mux(seed: u8) -> Result<(NullMux, UdpAddr), Error> {
     let id = Ed25519Keypair::from_seed([seed.wrapping_add(1); 32]);
     let auth = Arc::new(NullAuthenticator);
     Ok((
-        MultiProtocolNode::new(Host::new(socket, kp, &id)?, auth, KAD_K),
+        MultiProtocolNode::new(
+            Host::new(socket, kp, &id, [seed.wrapping_add(2); 32])?,
+            auth,
+            KAD_K,
+        ),
         addr,
     ))
 }
@@ -75,6 +79,13 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(NullMux, NullMux), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
+    // Cookie round-trip then the three Noise messages.
+    let (responder, ev) = responder
+        .recv_one(responder_seed, unused_relay_rng())
+        .run()?;
+    expect_handshake_progress(ev, initiator_addr)?;
+    let (initiator, ev) = initiator.recv_one([0; 32], unused_relay_rng()).run()?;
+    expect_handshake_progress(ev, responder_addr)?;
     let (responder, ev) = responder
         .recv_one(responder_seed, unused_relay_rng())
         .run()?;
@@ -95,6 +106,7 @@ fn expect_handshake_progress(ev: MultiProtocolEvent, expected: UdpAddr) -> Resul
         | MultiProtocolEvent::PubsubAbsorbed { .. }
         | MultiProtocolEvent::PubsubDelivered { .. }
         | MultiProtocolEvent::PubsubRelayed { .. }
+        | MultiProtocolEvent::PubsubRedundant { .. }
         | MultiProtocolEvent::KadPingRequestReceived { .. }
         | MultiProtocolEvent::KadPingResponseReceived { .. }
         | MultiProtocolEvent::KadFindNodeRequestReceived { .. }
@@ -122,6 +134,7 @@ fn expect_handshake_complete(ev: MultiProtocolEvent, expected: UdpAddr) -> Resul
         | MultiProtocolEvent::PubsubAbsorbed { .. }
         | MultiProtocolEvent::PubsubDelivered { .. }
         | MultiProtocolEvent::PubsubRelayed { .. }
+        | MultiProtocolEvent::PubsubRedundant { .. }
         | MultiProtocolEvent::KadPingRequestReceived { .. }
         | MultiProtocolEvent::KadPingResponseReceived { .. }
         | MultiProtocolEvent::KadFindNodeRequestReceived { .. }

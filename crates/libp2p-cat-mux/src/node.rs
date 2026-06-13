@@ -673,6 +673,9 @@ fn lift_pubsub_event(ev: PubsubMuxEvent) -> MultiProtocolEvent {
         PubsubMuxEvent::PubsubDelivered { addr, topic, data } => {
             MultiProtocolEvent::PubsubDelivered { addr, topic, data }
         }
+        PubsubMuxEvent::PubsubRedundant { addr, topic } => {
+            MultiProtocolEvent::PubsubRedundant { addr, topic }
+        }
         PubsubMuxEvent::PubsubRelayed {
             from,
             topic,
@@ -987,6 +990,7 @@ fn absorb_lookup_event(
         | MultiProtocolEvent::PubsubAbsorbed { .. }
         | MultiProtocolEvent::PubsubDelivered { .. }
         | MultiProtocolEvent::PubsubRelayed { .. }
+        | MultiProtocolEvent::PubsubRedundant { .. }
         | MultiProtocolEvent::KadPingRequestReceived { .. }
         | MultiProtocolEvent::KadPingResponseReceived { .. }
         | MultiProtocolEvent::KadFindNodeRequestReceived { .. }

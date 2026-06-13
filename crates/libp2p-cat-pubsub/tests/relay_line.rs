@@ -59,7 +59,10 @@ fn build_mux(seed: u8) -> Result<(NullMux, UdpAddr), Error> {
     let identity = Ed25519Keypair::from_seed([seed.wrapping_add(1); 32]);
     let auth = Arc::new(NullAuthenticator);
     Ok((
-        PubsubMux::new(Host::new(socket, keypair, &identity)?, auth),
+        PubsubMux::new(
+            Host::new(socket, keypair, &identity, [seed.wrapping_add(2); 32])?,
+            auth,
+        ),
         addr,
     ))
 }
@@ -93,6 +96,15 @@ fn handshake_pair(
     responder_seed: [u8; 32],
 ) -> Result<(NullMux, NullMux), Error> {
     let initiator = initiator.dial(responder_addr, initiator_seed).run()?;
+    // Cookie round-trip: responder challenges, initiator echoes,
+    // responder validates and writes msg2 — three HandshakeProgress
+    // steps before the two completions.
+    let (responder, ev) = responder
+        .recv_one(responder_seed, unused_relay_rng())
+        .run()?;
+    expect_handshake_progress(ev, initiator_addr)?;
+    let (initiator, ev) = initiator.recv_one([0; 32], unused_relay_rng()).run()?;
+    expect_handshake_progress(ev, responder_addr)?;
     let (responder, ev) = responder
         .recv_one(responder_seed, unused_relay_rng())
         .run()?;
@@ -220,5 +232,74 @@ fn relay_line_decodes_at_downstream() -> Result<(), Error> {
         })?;
     check(bob_prefix == payload, || {
         format!("bob payload mismatch: got {bob_prefix:?}")
+    })
+}
+
+#[test]
+fn relay_rank_gate_bounds_amplification() -> Result<(), Error> {
+    // The relay must re-broadcast at most `piece_count` pieces per
+    // generation: once its observed rank is full, further verified
+    // pieces are linearly dependent and surface as
+    // `PubsubRedundant` without being stored or forwarded.  This
+    // bounds relay amplification and recoder memory, terminating the
+    // multi-relay circulation the unbounded version suffered.
+    let (alice, alice_addr) = build_mux(0xA1)?;
+    let (relay, relay_addr) = build_mux(0xB2)?;
+    let (bob, bob_addr) = build_mux(0xC3)?;
+
+    let (alice, relay) =
+        handshake_pair(alice, relay, alice_addr, relay_addr, [0x44; 32], [0x55; 32])?;
+    let (_bob, relay) = handshake_pair(bob, relay, bob_addr, relay_addr, [0x66; 32], [0x77; 32])?;
+
+    let topic: Topic = "/chat/v1".try_into()?;
+    let payload: &[u8] = b"bounded relay amplification";
+    let piece_count: usize = 3;
+    let data = OriginalData::from_bytes(payload, piece_count).map_err(|e| Error::RlncLayer {
+        reason: e.to_string(),
+    })?;
+    let piece_byte_len = data.piece_byte_len();
+    let relay = relay.register_relay(topic.clone(), piece_count, piece_byte_len, ());
+
+    // Alice broadcasts `piece_count + 2` frames.  The standard-basis
+    // RNG cycles e0, e1, e2, e0, e1, so the first three pieces span
+    // the generation (rank-increasing) and the last two repeat
+    // earlier coding vectors (linearly dependent).
+    let surplus: usize = 2;
+    let emitted = piece_count + surplus;
+    let (_alice_after, ()) = alice
+        .broadcast(topic.clone(), data, emitted, standard_basis_rng())
+        .run()?;
+
+    // The relay forwards exactly the first `piece_count` pieces and
+    // reports the surplus as redundant, never re-broadcasting them.
+    let (_relay_after, relayed, redundant) = (0..emitted).try_fold(
+        (relay, 0usize, 0usize),
+        |(relay, relayed, redundant), idx| -> Result<(NullMux, usize, usize), Error> {
+            let (relay, ev) = relay.recv_one([0; 32], ones_rng_once()).run()?;
+            match ev {
+                MuxEvent::PubsubRelayed {
+                    from,
+                    topic: t,
+                    fanout_count,
+                } if from == alice_addr && t == topic && fanout_count == 1 => {
+                    Ok((relay, relayed + 1, redundant))
+                }
+                MuxEvent::PubsubRedundant { addr, topic: t }
+                    if addr == alice_addr && t == topic =>
+                {
+                    Ok((relay, relayed, redundant + 1))
+                }
+                other => Err(Error::PubsubProtocol {
+                    reason: format!("relay piece {idx}: unexpected event {other:?}"),
+                }),
+            }
+        },
+    )?;
+
+    check(relayed == piece_count, || {
+        format!("expected exactly {piece_count} relayed pieces, got {relayed}")
+    })?;
+    check(redundant == surplus, || {
+        format!("expected exactly {surplus} redundant pieces, got {redundant}")
     })
 }

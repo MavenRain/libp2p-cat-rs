@@ -14,8 +14,17 @@ use libp2p_cat_types::PeerId;
 /// states (`InitiatorAfterResponse`, `ResponderAfterE`) advance
 /// immediately within a single `recv_one` call and are never stored.
 pub(crate) enum HandshakeState {
-    /// Initiator has sent `msg1`, waiting on `msg2` from the remote.
-    InitiatorAwaitingResponse(InitiatorAfterE),
+    /// Initiator has sent `msg1`, waiting on either a cookie
+    /// challenge (answered by re-sending `msg1 || cookie` from the
+    /// retained `msg1` bytes) or `msg2` from the remote.
+    InitiatorAwaitingResponse {
+        /// The Noise state advanced past `write_e`.
+        after_e: InitiatorAfterE,
+        /// The exact `msg1` bytes sent, retained so a cookie
+        /// challenge can be answered without rebuilding the
+        /// handshake.
+        msg1: Vec<u8>,
+    },
     /// Responder has sent `msg2`, waiting on `msg3` from the remote.
     ResponderAwaitingFinalize(ResponderAfterResponse),
 }
